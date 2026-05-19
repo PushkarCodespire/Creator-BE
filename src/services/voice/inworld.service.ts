@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
-import axios from 'axios';
+import axios, { AxiosResponse } from 'axios';
 import { isCloudinaryConfigured, uploadToCloudinary } from '../../utils/cloudinary';
 
 const INWORLD_TTS_BASE   = 'https://api.inworld.ai';
@@ -110,7 +110,7 @@ export async function deleteVoice(voiceId: string): Promise<void> {
  * voiceId can be a cloned ID ("{workspace}__{voice}") or a preset name ("Hades").
  * Saves audio locally or to Cloudinary and returns the relative path.
  */
-async function _ttsRequest(voiceId: string, text: string, speakingRate: number, pitch: number): Promise<Awaited<ReturnType<typeof axios.post>>> {
+async function _ttsRequest(voiceId: string, text: string, speakingRate: number, pitch: number): Promise<AxiosResponse<any>> {
   return axios.post(
     `${INWORLD_TTS_BASE}/tts/v1/voice`,
     { text, voiceId, modelId: INWORLD_MODEL_ID, audioConfig: { audioEncoding: 'MP3', sampleRateHertz: 24000, speakingRate, pitch } },
@@ -132,7 +132,7 @@ export async function textToSpeech(
   const shortId = voiceId.includes('/') ? (voiceId.split('/').pop() ?? voiceId) : voiceId;
   const candidates = voiceId === shortId ? [voiceId] : [voiceId, shortId];
 
-  let res: Awaited<ReturnType<typeof axios.post>> | null = null;
+  let res: AxiosResponse<any> | null = null;
   let lastErr = '';
 
   for (const id of candidates) {

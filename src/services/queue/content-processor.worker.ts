@@ -63,7 +63,7 @@ export async function processContentJob(job: Job<ContentProcessingJobData>): Pro
 
     // Chunk content — transcripts use sentence-aware chunking (idea units),
     // other content uses character-based recursive splitting.
-    const isTranscript = content.type === 'YOUTUBE' || content.type === 'VIDEO';
+    const isTranscript = content.type === 'YOUTUBE_VIDEO';
     const chunks = chunkContent(content.rawText, {
       chunkSize: 800,
       chunkOverlap: 100,

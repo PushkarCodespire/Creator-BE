@@ -28,10 +28,11 @@ export const errorHandler = (
 
   // Multer upload errors — return 400 with a readable message, not 500
   if (err instanceof multer.MulterError) {
+    const me = err as multer.MulterError;
     const msg =
-      err.code === 'LIMIT_FILE_SIZE'  ? 'File too large. Maximum 25 MB per audio clip.' :
-      err.code === 'LIMIT_FILE_COUNT' ? 'Too many files. Maximum 10 audio clips allowed.' :
-      err.message;
+      me.code === 'LIMIT_FILE_SIZE'  ? 'File too large. Maximum 25 MB per audio clip.' :
+      me.code === 'LIMIT_FILE_COUNT' ? 'Too many files. Maximum 10 audio clips allowed.' :
+      me.message;
     return sendError(res, 400, 'UPLOAD_ERROR', msg);
   }
 

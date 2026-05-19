@@ -36,7 +36,7 @@ async function buildTrainingData(creatorId: string): Promise<{ jsonl: string; to
   if (!creator) throw new Error('Creator not found');
 
   // Parse fewShotQA — stored as JSON, shape: { scenario: string; answer: string }[]
-  const fewShotQA = (creator.fewShotQA as FewShotQA[] | null) || [];
+  const fewShotQA = (creator.fewShotQA as unknown as FewShotQA[] | null) || [];
   const answeredQA = fewShotQA.filter(qa => qa.answer?.trim());
 
   const totalExamples = creator.corrections.length + answeredQA.length;
