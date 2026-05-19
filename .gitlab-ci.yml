@@ -1,0 +1,9 @@
+# GitLab CI configuration for VMS Platform API
+include:
+  - project: 'codespire-core/ci-templates'
+    file: '/complete/nodejs-prisma-api.yml'
+
+test:unit:
+  extends: .test:nodejs
+  stage: test
+  allow_failure: true

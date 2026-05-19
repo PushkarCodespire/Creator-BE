@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: creator-platform-db
+    environment:
+      POSTGRES_PASSWORD: postgres_secure_password_2025
+      POSTGRES_DB: creator_platform
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # Optional: Adminer for database management UI
+  adminer:
+    image: adminer
+    container_name: creator-platform-adminer
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

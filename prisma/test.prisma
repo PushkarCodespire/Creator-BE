@@ -1,0 +1,12 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = "postgresql://postgres:test123@127.0.0.1:5432/creator_platform?schema=public"
+}
+
+model Test {
+  id String @id @default(uuid())
+}

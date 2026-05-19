@@ -1,0 +1,68 @@
+# ===========================================
+# ALERT RULES FOR PROMETHEUS
+# ===========================================
+
+groups:
+  - name: api-alerts
+    rules:
+      # High error rate
+      - alert: HighErrorRate
+        expr: sum(rate(http_request_duration_seconds_count{status=~"5.."}[5m])) by (job) / sum(rate(http_request_duration_seconds_count[5m])) by (job) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate ({{ $value }}%)"
+          description: "API error rate is above 5% for more than 2 minutes"
+
+      # High response time
+      - alert: HighResponseTime
+        expr: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, job)) > 2
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High response time ({{ $value }}s)"
+          description: "95th percentile response time is above 2 seconds"
+
+      # High memory usage
+      - alert: HighMemoryUsage
+        expr: (nodejs_heap_size_used_bytes / nodejs_heap_size_total_bytes) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage ({{ $value }}%)"
+          description: "Node.js heap usage is above 80%"
+
+      # High CPU usage
+      - alert: HighCPUUsage
+        expr: rate(process_cpu_seconds_total[5m]) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage ({{ $value }}%)"
+          description: "Process CPU usage is above 80%"
+
+  - name: system-alerts
+    rules:
+      # Low disk space
+      - alert: LowDiskSpace
+        expr: (node_filesystem_avail_bytes / node_filesystem_size_bytes) < 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Low disk space ({{ $value }}%)"
+          description: "Available disk space is below 10%"
+
+      # High load average
+      - alert: HighLoadAverage
+        expr: node_load1 > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High load average ({{ $value }})"
+          description: "1-minute load average is above 5"
