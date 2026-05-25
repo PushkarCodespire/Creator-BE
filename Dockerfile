@@ -61,8 +61,16 @@ COPY --from=builder /app/src/prisma ./src/prisma
 # Copy seed/utility scripts so the K8s seed Job can run them
 COPY --from=builder /app/scripts ./scripts
 
+# Bake seed avatar images into the image so the entrypoint can copy them
+# to the PVC (/app/uploads/) on first start without a network call.
+COPY seed-assets ./seed-assets
+
+# Entrypoint: creates upload sub-dirs + seeds avatars into PVC before Node starts
+COPY docker-entrypoint.sh ./docker-entrypoint.sh
+RUN chmod +x ./docker-entrypoint.sh
+
 # Create directories for logs and uploads
-RUN mkdir -p logs uploads data && \
+RUN mkdir -p logs uploads data seed-assets/avatars && \
     chown -R nodejs:nodejs /app
 
 # Switch to non-root user
@@ -75,8 +83,8 @@ EXPOSE 5000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
   CMD node -e "require('http').get('http://localhost:5000/api/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
 
-# Use dumb-init to handle signals properly
-ENTRYPOINT ["dumb-init", "--"]
+# dumb-init → entrypoint → node
+ENTRYPOINT ["dumb-init", "--", "/app/docker-entrypoint.sh"]
 
 # Start the application
 CMD ["node", "dist/src/index.js"]

@@ -52,17 +52,31 @@ const sendViaBrevo = async (options: EmailOptions): Promise<boolean> => {
   return true;
 };
 
-// ── nodemailer SMTP (local dev fallback) ────────────────────────────────────
+// ── nodemailer SMTP ──────────────────────────────────────────────────────────
 let _transporter: import('nodemailer').Transporter | null = null;
 const getTransporter = async () => {
   if (_transporter) return _transporter;
-  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) return null;
+  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
+    logError(new Error('SMTP not configured: SMTP_HOST, SMTP_USER or SMTP_PASS is missing'), {
+      context: 'getTransporter',
+      smtpHost: SMTP_HOST || '(empty)',
+      smtpUser: SMTP_USER || '(empty)',
+      smtpPassSet: !!SMTP_PASS,
+    });
+    return null;
+  }
   const nodemailer = await import('nodemailer');
   _transporter = nodemailer.default.createTransport({
     host: SMTP_HOST,
     port: SMTP_PORT,
     secure: SMTP_PORT === 465,
+    // requireTLS forces STARTTLS on port 587 — required by Office 365 / Outlook
+    requireTLS: SMTP_PORT !== 465,
     auth: { user: SMTP_USER, pass: SMTP_PASS },
+    tls: {
+      // Avoid TLS handshake failures on strict corporate SMTP servers
+      rejectUnauthorized: true,
+    },
   });
   return _transporter;
 };
@@ -102,7 +116,11 @@ export const sendEmail = async (options: EmailOptions): Promise<boolean> => {
       logInfo(`Email sent (SMTP): ${options.subject} to ${options.to}`);
       return true;
     }
-    logInfo(`Email skipped (not configured): ${options.subject} to ${options.to}`);
+    logError(new Error('SMTP transporter unavailable — email not sent'), {
+      context: 'sendEmail',
+      subject: options.subject,
+      to: options.to,
+    });
     return false;
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : String(error);
