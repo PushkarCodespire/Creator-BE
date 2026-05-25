@@ -39,18 +39,22 @@ function run(label, script) {
 }
 
 async function main() {
-  const userCount = await prisma.user.count();
   const force = process.env.FORCE_SEED === 'yes';
 
-  if (userCount > 0 && !force) {
-    console.log(`DB already has ${userCount} users — skipping seed. (Set FORCE_SEED=yes to run anyway.)`);
+  // Check for admin specifically rather than any user.
+  // A partial seed (e.g. only featured creators were upserted) leaves userCount > 0
+  // but admin@platform.com missing — the old userCount guard silently skipped in that case.
+  const adminExists = await prisma.user.findUnique({ where: { email: 'admin@platform.com' } });
+
+  if (adminExists && !force) {
+    console.log(`Admin already seeded — skipping. (Set FORCE_SEED=yes to run anyway.)`);
     return;
   }
 
   if (force) {
-    console.log(`FORCE_SEED=yes — running seed chain even though DB has ${userCount} users.`);
+    console.log(`FORCE_SEED=yes — running seed chain even though admin may exist.`);
   } else {
-    console.log('DB is empty — running full seed chain.');
+    console.log('Admin not found — running full seed chain.');
   }
 
   await prisma.$disconnect();
