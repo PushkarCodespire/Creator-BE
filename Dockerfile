@@ -33,8 +33,11 @@ RUN npm prune --production
 # Stage 2: Production
 FROM node:20-alpine
 
-# Install dumb-init for proper signal handling
-RUN apk add --no-cache dumb-init
+# Install dumb-init for signal handling + openssl CLI so Prisma's runtime
+# platform detection can run `openssl version` and select the correct
+# linux-musl-openssl-3.0.x engine (without it, detection fails and Prisma
+# defaults to openssl-1.1.x which is not present on Alpine 3.17+).
+RUN apk add --no-cache dumb-init openssl
 
 # Create app directory
 WORKDIR /app
