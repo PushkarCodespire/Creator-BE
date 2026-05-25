@@ -55,6 +55,9 @@ COPY --from=builder /app/dist ./dist
 # Copy Prisma files for migrations
 COPY --from=builder /app/src/prisma ./src/prisma
 
+# Copy seed/utility scripts so the K8s seed Job can run them
+COPY --from=builder /app/scripts ./scripts
+
 # Create directories for logs and uploads
 RUN mkdir -p logs uploads data && \
     chown -R nodejs:nodejs /app
