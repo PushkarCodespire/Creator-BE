@@ -462,7 +462,7 @@ router.post('/voice-preview', async (req, res) => {
           speakingRate: creatorVoice.voiceSpeakingRate ?? undefined,
           pitch:        creatorVoice.voicePitch        ?? undefined,
         });
-        const baseUrl   = process.env.API_URL || `http://localhost:${process.env.PORT || 5000}`;
+        const baseUrl   = process.env.API_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 5000}`;
         audioUrl = audioPath.startsWith('http') ? audioPath : `${baseUrl}/uploads/${audioPath}`;
       } catch (ttsErr: unknown) {
         previewError = ttsErr instanceof Error ? ttsErr.message : String(ttsErr);
@@ -473,7 +473,7 @@ router.post('/voice-preview', async (req, res) => {
     if (!audioUrl && creator?.voiceIdChatterbox && chatterboxSvc.isConfigured()) {
       try {
         const audioPath = await chatterboxSvc.textToSpeech(creator.voiceIdChatterbox, previewText);
-        const baseUrl   = process.env.API_URL || `http://localhost:${process.env.PORT || 5000}`;
+        const baseUrl   = process.env.API_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 5000}`;
         audioUrl = audioPath.startsWith('http') ? audioPath : `${baseUrl}/uploads/${audioPath}`;
         previewError = null; // chatterbox succeeded, clear the error
       } catch (ttsErr: unknown) {
