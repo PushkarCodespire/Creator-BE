@@ -349,12 +349,14 @@ function parseInstagramExportZip(zip: AdmZip): ParsedCaption[] {
   for (const entry of entries) {
     const name = entry.entryName;
 
-    // Feed posts: posts_1.json, posts_2.json, ...
-    const isFeedPost = /your_instagram_activity\/posts\/posts_\d+\.json$/i.test(name);
+    // Old format: your_instagram_activity/posts/posts_1.json
+    const isOldFeedPost = /your_instagram_activity\/posts\/posts_\d+\.json$/i.test(name);
+    // New format (2024+): your_instagram_activity/media/posts.json or posts_1.json
+    const isNewFeedPost = /your_instagram_activity\/media\/posts(_\d+)?\.json$/i.test(name);
     // Reels / other content
     const isOtherContent = /your_instagram_activity\/media\/other_content\.json$/i.test(name);
 
-    if (!isFeedPost && !isOtherContent) continue;
+    if (!isOldFeedPost && !isNewFeedPost && !isOtherContent) continue;
 
     let data: unknown;
     try {
@@ -367,7 +369,7 @@ function parseInstagramExportZip(zip: AdmZip): ParsedCaption[] {
     if (!Array.isArray(data)) continue;
 
     for (const post of data as Record<string, unknown>[]) {
-      const postTimestamp: number = (post?.timestamp as number) ?? 0;
+      const postTimestamp: number = ((post?.timestamp ?? post?.creation_timestamp) as number) ?? 0;
 
       // ── FORMAT A: caption in media[n].title ──────────────────────────────
       const mediaItems = (post?.media as Record<string, unknown>[]) ?? [];
@@ -377,6 +379,14 @@ function parseInstagramExportZip(zip: AdmZip): ParsedCaption[] {
         seen.add(caption);
         const ts: number = (item?.creation_timestamp as number) ?? postTimestamp;
         results.push({ caption, timestamp: ts || postTimestamp });
+      }
+
+      // ── FORMAT A (variant): top-level title field on post object ─────────
+      // new posts_1.json puts caption at post.title, not inside media
+      const topLevelCaption = (post?.title as string | undefined)?.trim();
+      if (topLevelCaption && !seen.has(topLevelCaption)) {
+        seen.add(topLevelCaption);
+        results.push({ caption: topLevelCaption, timestamp: postTimestamp });
       }
 
       // ── FORMAT B: caption in label_values[n].value where label === "Caption" ──
