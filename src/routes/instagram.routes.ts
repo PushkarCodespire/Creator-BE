@@ -324,18 +324,25 @@ interface ParsedCaption {
 /**
  * Extracts post captions from an Instagram data export ZIP.
  *
- * Instagram export structure (JSON format):
- *   your_instagram_activity/posts/posts_1.json  ← feed posts (array of post objects)
- *   your_instagram_activity/posts/posts_2.json  ← overflow (same format)
- *   your_instagram_activity/media/other_content.json ← reels / other (same format)
+ * Instagram has two export formats depending on when / how the export was requested:
  *
- * Each post object looks like:
- *   { timestamp: number, media: [{ title: "caption text", uri: "...", creation_timestamp: number }] }
+ * FORMAT A — Old format (exported via Settings → Security → Download Data):
+ *   your_instagram_activity/posts/posts_1.json
+ *   Each item: { timestamp, media: [{ title: "caption", creation_timestamp, uri }] }
+ *   Caption is in media[n].title
  *
- * The `title` field on each media item IS the caption.
+ * FORMAT B — New Accounts Center format (2024+, exported via Accounts Center):
+ *   your_instagram_activity/posts/posts_1.json  OR
+ *   your_instagram_activity/media/other_content.json
+ *   Each item: { timestamp, media: [], label_values: [{ label: "Caption", value: "caption text" }, { label: "URL", value: "https://..." }] }
+ *   Caption is in label_values[n].value where label_values[n].label === "Caption"
+ *   URL is in label_values[n].value where label_values[n].label === "URL"
+ *
+ * This parser handles BOTH formats.
  */
 function parseInstagramExportZip(zip: AdmZip): ParsedCaption[] {
   const results: ParsedCaption[] = [];
+  const seen = new Set<string>(); // deduplicate by caption text
 
   const entries = zip.getEntries();
 
@@ -359,20 +366,44 @@ function parseInstagramExportZip(zip: AdmZip): ParsedCaption[] {
 
     if (!Array.isArray(data)) continue;
 
-    for (const post of data) {
-      const mediaItems: unknown[] = post?.media ?? [];
-      const postTimestamp: number = post?.timestamp ?? 0;
+    for (const post of data as Record<string, unknown>[]) {
+      const postTimestamp: number = (post?.timestamp as number) ?? 0;
 
+      // ── FORMAT A: caption in media[n].title ──────────────────────────────
+      const mediaItems = (post?.media as Record<string, unknown>[]) ?? [];
       for (const item of mediaItems) {
-        const caption = (item as { title?: string })?.title?.trim();
-        if (!caption) continue;
+        const caption = (item?.title as string | undefined)?.trim();
+        if (!caption || seen.has(caption)) continue;
+        seen.add(caption);
+        const ts: number = (item?.creation_timestamp as number) ?? postTimestamp;
+        results.push({ caption, timestamp: ts || postTimestamp });
+      }
 
-        const itemTimestamp: number = (item as { creation_timestamp?: number })?.creation_timestamp ?? postTimestamp;
-        const uri: string = (item as { uri?: string })?.uri ?? '';
-        // Build a permalink-like URL from the URI if possible (best-effort)
-        const permalink = uri ? undefined : undefined;
+      // ── FORMAT B: caption in label_values[n].value where label === "Caption" ──
+      const labelValues = (post?.label_values as Record<string, unknown>[]) ?? [];
+      if (labelValues.length > 0) {
+        // Find caption value
+        const captionEntry = labelValues.find(lv => (lv?.label as string) === 'Caption');
+        const caption = (captionEntry?.value as string | undefined)?.trim();
 
-        results.push({ caption, timestamp: itemTimestamp || postTimestamp, permalink });
+        if (caption && !seen.has(caption)) {
+          seen.add(caption);
+          // Find URL value (permalink)
+          const urlEntry = labelValues.find(lv => (lv?.label as string) === 'URL');
+          const permalink = (urlEntry?.value as string | undefined) || undefined;
+          results.push({ caption, timestamp: postTimestamp, permalink });
+        }
+
+        // Also check nested label_values inside label_values (some exports nest them)
+        for (const lv of labelValues) {
+          const nested = (lv?.label_values as Record<string, unknown>[]) ?? [];
+          const nestedCaption = nested.find(n => (n?.label as string) === 'Caption');
+          const cap = (nestedCaption?.value as string | undefined)?.trim();
+          if (cap && !seen.has(cap)) {
+            seen.add(cap);
+            results.push({ caption: cap, timestamp: postTimestamp });
+          }
+        }
       }
     }
   }
