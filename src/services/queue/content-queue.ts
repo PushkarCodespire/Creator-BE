@@ -11,7 +11,7 @@ export interface ContentProcessingJobData {
   contentId: string;
   creatorId: string;
   userId: string;
-  type: 'YOUTUBE_VIDEO' | 'MANUAL_TEXT' | 'FAQ';
+  type: 'YOUTUBE_VIDEO' | 'MANUAL_TEXT' | 'FAQ' | 'INSTAGRAM_POST';
   url?: string;
   text?: string;
   title?: string;

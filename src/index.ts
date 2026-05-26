@@ -56,6 +56,7 @@ import mediaRoutes from './routes/media.routes';
 import { updateQueueMetrics } from './utils/metrics';
 import permissionsRoutes from './routes/permissions.routes';
 import downloadRoutes from './routes/download.routes';
+import instagramRoutes from './routes/instagram.routes';
 
 // Import middleware
 import { errorHandler } from './middleware/errorHandler';
@@ -296,6 +297,7 @@ app.use('/api/user', userDashboardRoutes);
 app.use('/api/creators', creatorRoutes);
 app.use('/api/chat', chatRoutes);
 app.use('/api/content', contentRoutes);
+app.use('/api/instagram', instagramRoutes);
 app.use('/api/programs', programRoutes);
 app.use('/api/bookings', bookingRoutes);
 app.use('/api', homeRoutes); // handles /api/home/featured and /api/admin/home/*

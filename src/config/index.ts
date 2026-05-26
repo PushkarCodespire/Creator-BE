@@ -125,6 +125,13 @@ export const config = {
   // Brand Deal Commission
   brandDeal: {
     platformCommission: 0.1 // 10%
+  },
+
+  // Instagram OAuth
+  instagram: {
+    clientId: process.env.INSTAGRAM_CLIENT_ID || '',
+    clientSecret: process.env.INSTAGRAM_CLIENT_SECRET || '',
+    redirectUri: process.env.INSTAGRAM_REDIRECT_URI || 'http://localhost:5000/api/instagram/callback'
   }
 };
 

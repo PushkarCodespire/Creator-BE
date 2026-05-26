@@ -124,6 +124,9 @@ model Creator {
   tags                  String[]
   youtubeUrl            String?
   instagramUrl          String?
+  instagramUserId       String?
+  instagramAccessToken  String?
+  instagramTokenExpiresAt DateTime?
   twitterUrl            String?
   websiteUrl            String?
   isVerified            Boolean          @default(false)
