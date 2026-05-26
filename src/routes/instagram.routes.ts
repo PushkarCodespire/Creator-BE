@@ -1,13 +1,16 @@
 // ===========================================
-// INSTAGRAM OAUTH ROUTES
-// GET /api/instagram/auth-url   → authenticated (creator only)
-// GET /api/instagram/callback   → public (called by Instagram)
-// GET /api/instagram/status     → authenticated (creator only)
-// POST /api/instagram/sync      → authenticated, fetch latest posts
-// DELETE /api/instagram/disconnect → authenticated (creator only)
+// INSTAGRAM ROUTES
+// GET  /api/instagram/auth-url       → authenticated (creator only)
+// GET  /api/instagram/callback       → public (called by Instagram)
+// GET  /api/instagram/status         → authenticated (creator only)
+// POST /api/instagram/sync           → authenticated, re-fetch latest posts
+// POST /api/instagram/upload-export  → authenticated, parse IG data export ZIP
+// DELETE /api/instagram/disconnect   → authenticated (creator only)
 // ===========================================
 
 import { Router, Request, Response } from 'express';
+import multer from 'multer';
+import AdmZip from 'adm-zip';
 import { authenticate, requireCreator } from '../middleware/auth';
 import { asyncHandler, AppError } from '../middleware/errorHandler';
 import {
@@ -22,6 +25,19 @@ import { contentQueue, isContentQueueEnabled } from '../services/queue/content-q
 import prisma from '../../prisma/client';
 import { config } from '../config';
 import { logInfo, logError, logWarning } from '../utils/logger';
+
+// Multer: accept only ZIP files in memory (max 100 MB)
+const zipUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 100 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype === 'application/zip' || file.originalname.endsWith('.zip')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only .zip files are accepted'));
+    }
+  }
+});
 
 const router = Router();
 
@@ -202,6 +218,168 @@ router.delete(
     res.json({ success: true, message: 'Instagram account disconnected.' });
   })
 );
+
+// ─── POST /api/instagram/upload-export ────────────────────────────────────────
+// Accepts an Instagram data export ZIP, extracts post captions and bio,
+// and imports them into the creator's knowledge base as INSTAGRAM_POST entries.
+
+router.post(
+  '/upload-export',
+  authenticate,
+  requireCreator,
+  zipUpload.single('export'),
+  asyncHandler(async (req: Request, res: Response) => {
+    if (!req.file) {
+      throw new AppError('No ZIP file uploaded', 400);
+    }
+
+    const userId = req.user!.id;
+    const creator = await prisma.creator.findUnique({ where: { userId } });
+    if (!creator) throw new AppError('Creator not found', 404);
+
+    // Parse the ZIP in memory
+    let zip: AdmZip;
+    try {
+      zip = new AdmZip(req.file.buffer);
+    } catch {
+      throw new AppError('Invalid ZIP file — please upload your Instagram data export', 400);
+    }
+
+    const captions = parseInstagramExportZip(zip);
+
+    if (captions.length === 0) {
+      return res.json({
+        success: true,
+        message: 'No post captions found in this export. Make sure you selected "Posts" when requesting your Instagram data.',
+        imported: 0
+      });
+    }
+
+    // Deduplicate against already-imported posts
+    const existing = await prisma.creatorContent.findMany({
+      where: { creatorId: creator.id, type: 'INSTAGRAM_POST' },
+      select: { title: true }
+    });
+    const existingTitles = new Set(existing.map(e => e.title));
+
+    let imported = 0;
+    for (const caption of captions) {
+      const title = `Instagram Post — ${new Date(caption.timestamp * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`;
+
+      if (existingTitles.has(title)) continue;
+
+      const content = await prisma.creatorContent.create({
+        data: {
+          creatorId: creator.id,
+          title,
+          type: 'INSTAGRAM_POST',
+          sourceUrl: caption.permalink || null,
+          status: 'PROCESSING',
+          rawText: caption.caption
+        }
+      });
+
+      const jobData = { contentId: content.id, creatorId: creator.id, userId, type: 'INSTAGRAM_POST' as const };
+
+      if (isContentQueueEnabled && contentQueue) {
+        await contentQueue.add('process-content', jobData);
+      } else {
+        setImmediate(async () => {
+          try {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            await processContentJob({ data: jobData, progress: () => {} } as any);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            await prisma.creatorContent.update({
+              where: { id: content.id },
+              data: { status: 'FAILED', errorMessage: msg }
+            }).catch(() => {});
+          }
+        });
+      }
+
+      imported++;
+    }
+
+    logInfo(`[Instagram Export] Imported ${imported} posts for creator ${creator.id}`);
+    res.json({
+      success: true,
+      message: imported > 0
+        ? `${imported} post${imported !== 1 ? 's' : ''} imported and queued for training.`
+        : 'No new posts to import — all captions already exist in your knowledge base.',
+      imported,
+      found: captions.length
+    });
+  })
+);
+
+// ─── Helper: parse Instagram export ZIP ───────────────────────────────────────
+
+interface ParsedCaption {
+  caption: string;
+  timestamp: number;
+  permalink?: string;
+}
+
+/**
+ * Extracts post captions from an Instagram data export ZIP.
+ *
+ * Instagram export structure (JSON format):
+ *   your_instagram_activity/posts/posts_1.json  ← feed posts (array of post objects)
+ *   your_instagram_activity/posts/posts_2.json  ← overflow (same format)
+ *   your_instagram_activity/media/other_content.json ← reels / other (same format)
+ *
+ * Each post object looks like:
+ *   { timestamp: number, media: [{ title: "caption text", uri: "...", creation_timestamp: number }] }
+ *
+ * The `title` field on each media item IS the caption.
+ */
+function parseInstagramExportZip(zip: AdmZip): ParsedCaption[] {
+  const results: ParsedCaption[] = [];
+
+  const entries = zip.getEntries();
+
+  for (const entry of entries) {
+    const name = entry.entryName;
+
+    // Feed posts: posts_1.json, posts_2.json, ...
+    const isFeedPost = /your_instagram_activity\/posts\/posts_\d+\.json$/i.test(name);
+    // Reels / other content
+    const isOtherContent = /your_instagram_activity\/media\/other_content\.json$/i.test(name);
+
+    if (!isFeedPost && !isOtherContent) continue;
+
+    let data: unknown;
+    try {
+      data = JSON.parse(entry.getData().toString('utf8'));
+    } catch {
+      logWarning(`[Instagram Export] Failed to parse ${name}`);
+      continue;
+    }
+
+    if (!Array.isArray(data)) continue;
+
+    for (const post of data) {
+      const mediaItems: unknown[] = post?.media ?? [];
+      const postTimestamp: number = post?.timestamp ?? 0;
+
+      for (const item of mediaItems) {
+        const caption = (item as { title?: string })?.title?.trim();
+        if (!caption) continue;
+
+        const itemTimestamp: number = (item as { creation_timestamp?: number })?.creation_timestamp ?? postTimestamp;
+        const uri: string = (item as { uri?: string })?.uri ?? '';
+        // Build a permalink-like URL from the URI if possible (best-effort)
+        const permalink = uri ? undefined : undefined;
+
+        results.push({ caption, timestamp: itemTimestamp || postTimestamp, permalink });
+      }
+    }
+  }
+
+  logInfo(`[Instagram Export] Extracted ${results.length} captions from ZIP`);
+  return results;
+}
 
 // ─── Helper: import posts as CreatorContent ────────────────────────────────────
 
