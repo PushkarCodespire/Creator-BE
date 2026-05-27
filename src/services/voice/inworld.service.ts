@@ -153,7 +153,18 @@ export async function textToSpeech(
     }
   }
 
-  if (!res) throw new Error(lastErr || 'Inworld TTS failed for all voiceId candidates');
+  // All cloned-voice candidates 404'd — the voice was likely created on a different
+  // Inworld account/key. Fall back to the configured default preset voice so the
+  // feature still works even if the cloned voice is unavailable.
+  if (!res) {
+    const fallbackId = process.env.INWORLD_DEFAULT_VOICE || 'Hades';
+    if (voiceId !== fallbackId) {
+      console.warn(`[inworld] All voiceId candidates failed (${lastErr}) — falling back to default voice "${fallbackId}"`);
+      res = await _ttsRequest(fallbackId, text, speakingRate, pitch);
+    } else {
+      throw new Error(lastErr || 'Inworld TTS failed for all voiceId candidates');
+    }
+  }
 
   console.log('[inworld] TTS response keys:', Object.keys(res.data || {}));
 
