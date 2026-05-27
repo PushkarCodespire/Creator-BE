@@ -18,10 +18,17 @@ import {
   AI_MODERATION_LIMITS,
 } from './moderation-config';
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-  timeout: AI_MODERATION_LIMITS.timeoutMs,
-});
+// OpenAI client is created lazily so startup doesn't crash when key is absent.
+let _openai: OpenAI | null = null;
+function getOpenAIClient(): OpenAI {
+  if (!_openai) {
+    _openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
+      timeout: AI_MODERATION_LIMITS.timeoutMs,
+    });
+  }
+  return _openai;
+}
 
 class AIModerationService {
   /**
@@ -74,7 +81,7 @@ class AIModerationService {
       }
 
       const truncated = content.substring(0, 30000);
-      const response = await openai.moderations.create({
+      const response = await getOpenAIClient().moderations.create({
         input: truncated,
         model: 'omni-moderation-latest',
       });
