@@ -25,7 +25,10 @@ export async function retrieveRelevantKnowledge(
         }
 
         // 2. Hybrid search (semantic + keyword) over local vector store
-        const hybridResults = hybridSearch(creatorId, queryEmbedding, query, topK, 0.7);
+        // 0.55 threshold (was 0.7) — allows short-form content like Instagram captions
+        // and FAQ entries to be retrieved. Long-form content scores higher anyway
+        // so this doesn't noticeably degrade precision on YouTube/article results.
+        const hybridResults = hybridSearch(creatorId, queryEmbedding, query, topK, 0.55);
 
         if (hybridResults.length > 0) {
             return hybridResults.map(result => result.text);

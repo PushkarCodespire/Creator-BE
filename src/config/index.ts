@@ -62,10 +62,16 @@ export const config = {
     expiresIn: process.env.JWT_EXPIRES_IN || '7d'
   },
 
-  // OpenAI
+  // Gemini (primary AI provider — free tier)
+  gemini: {
+    apiKey: process.env.GEMINI_API_KEY || '',
+    model: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
+  },
+
+  // OpenAI (fallback AI provider)
   openai: {
     apiKey: process.env.OPENAI_API_KEY || '',
-    model: process.env.OPENAI_MODEL || 'gpt-4o-mini'
+    model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
   },
 
   // AI Moderation
@@ -131,7 +137,11 @@ export const config = {
   instagram: {
     clientId: process.env.INSTAGRAM_CLIENT_ID || '',
     clientSecret: process.env.INSTAGRAM_CLIENT_SECRET || '',
-    redirectUri: process.env.INSTAGRAM_REDIRECT_URI || 'http://localhost:5000/api/instagram/callback'
+    redirectUri: process.env.INSTAGRAM_REDIRECT_URI || 'http://localhost:5000/api/instagram/callback',
+    // Parent Facebook App — used as fallback for long-lived token exchange when
+    // graph.instagram.com rejects the exchange (FLfB-configured apps).
+    facebookAppId: process.env.FACEBOOK_APP_ID || '',
+    facebookAppSecret: process.env.FACEBOOK_APP_SECRET || ''
   }
 };
 
@@ -144,8 +154,12 @@ export function validateConfig() {
     logWarning(`Missing required config: ${missing.join(', ')}`);
   }
 
-  if (!config.openai.apiKey) {
-    logWarning('OpenAI API key not configured. AI features will not work.');
+  if (!config.gemini.apiKey && !config.openai.apiKey) {
+    logWarning('No AI provider configured. Set GEMINI_API_KEY (primary) or OPENAI_API_KEY (fallback). AI features will not work.');
+  } else if (config.gemini.apiKey) {
+    logWarning(`AI provider: Gemini (${config.gemini.model}) primary${config.openai.apiKey ? ', OpenAI fallback active' : ', no OpenAI fallback'}`);
+  } else {
+    logWarning('AI provider: OpenAI only (no Gemini key). Set GEMINI_API_KEY to use free tier as primary.');
   }
 
   return missing.length === 0;

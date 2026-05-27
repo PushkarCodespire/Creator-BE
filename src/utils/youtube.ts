@@ -15,7 +15,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import ytdl from '@distube/ytdl-core';
-import { openai, isOpenAIConfigured } from './openai';
+import { openai, isOpenAIConfigured, isAIConfigured } from './openai';
+import { isGeminiConfigured, transcribeAudioWithGemini } from './gemini';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { logInfo, logWarning, logError, logDebug } from './logger';
 
@@ -950,9 +951,9 @@ export async function fetchYouTubeTranscript(url: string): Promise<{
       // Continue to next method
     }
 
-    // Method 4: Fallback to audio transcription with Whisper
-    if (isOpenAIConfigured()) {
-      logInfo(`[YouTube] Method 4: Attempting Whisper audio transcription...`);
+    // Method 4: Fallback to audio transcription (Gemini first, then Whisper)
+    if (isAIConfigured()) {
+      logInfo(`[YouTube] Method 4: Attempting audio transcription (${isGeminiConfigured() ? 'Gemini' : 'Whisper'})...`);
       try {
         const transcriptFromAudio = await transcribeYouTubeAudio(videoId);
 
@@ -970,7 +971,7 @@ export async function fetchYouTubeTranscript(url: string): Promise<{
         logError(new Error(`[YouTube] Whisper error: ${whisperErrorMessage}`));
       }
     } else {
-      logInfo(`[YouTube] Method 4 skipped: OpenAI not configured`);
+      logInfo(`[YouTube] Method 4 skipped: no AI provider configured`);
     }
 
     // All methods failed - provide clear guidance
@@ -978,15 +979,15 @@ export async function fetchYouTubeTranscript(url: string): Promise<{
     logError(new Error(`[YouTube] ALL METHODS FAILED for video: ${videoId}`));
     logError(new Error('[YouTube] ========================================'));
     logError(new Error('[YouTube] Environment check'));
-    logError(new Error(`[YouTube] Environment: Proxy=${YOUTUBE_PROXY ? 'Yes' : 'No'}, Cookies=${(YOUTUBE_COOKIE_ENV || YOUTUBE_COOKIES_ENV) ? 'Yes' : 'No'}, Players=${YOUTUBE_PLAYER_CLIENTS || 'Default'}, OpenAI=${isOpenAIConfigured() ? 'Yes' : 'No'}`));
+    logError(new Error(`[YouTube] Environment: Proxy=${YOUTUBE_PROXY ? 'Yes' : 'No'}, Cookies=${(YOUTUBE_COOKIE_ENV || YOUTUBE_COOKIES_ENV) ? 'Yes' : 'No'}, Players=${YOUTUBE_PLAYER_CLIENTS || 'Default'}, Gemini=${isGeminiConfigured() ? 'Yes' : 'No'}, OpenAI=${isOpenAIConfigured() ? 'Yes' : 'No'}`));
     logError(new Error('[YouTube] Troubleshooting'));
-    logError(new Error('[YouTube] Troubleshooting: 1. Configure YOUTUBE_PROXY, 2. YOUTUBE_COOKIE/YOUTUBE_COOKIES, 3. YOUTUBE_PLAYER_CLIENTS, 4. OPENAI_API_KEY'));
+    logError(new Error('[YouTube] Troubleshooting: 1. Configure YOUTUBE_PROXY, 2. YOUTUBE_COOKIE/YOUTUBE_COOKIES, 3. YOUTUBE_PLAYER_CLIENTS, 4. GEMINI_API_KEY (or OPENAI_API_KEY)'));
     logError(new Error('[YouTube] ========================================'));
 
-    const hasOpenAI = isOpenAIConfigured();
-    const errorMsg = hasOpenAI
+    const hasAI = isAIConfigured();
+    const errorMsg = hasAI
       ? 'Unable to fetch transcript from this video. YouTube may be blocking transcript access, or the video does not have captions enabled. Please use the "Manual Text" option to add your content manually.'
-      : 'Unable to fetch transcript from this video. YouTube may be blocking transcript access, or the video does not have captions enabled. Please configure OPENAI_API_KEY to enable audio transcription fallback, or use the "Manual Text" option instead.';
+      : 'Unable to fetch transcript from this video. No AI provider is configured for audio fallback. Set GEMINI_API_KEY or OPENAI_API_KEY, or use the "Manual Text" option instead.';
 
     throw new Error(errorMsg);
   } catch (error: unknown) {
@@ -1144,8 +1145,8 @@ async function downloadYouTubeAudioToTempFile(videoId: string): Promise<string> 
 }
 
 async function transcribeYouTubeAudio(videoId: string): Promise<string> {
-  if (!isOpenAIConfigured()) {
-    throw new Error('OpenAI API key not configured for audio transcription');
+  if (!isAIConfigured()) {
+    throw new Error('No AI provider configured for audio transcription. Set GEMINI_API_KEY or OPENAI_API_KEY.');
   }
 
   let filePath: string | null = null;
@@ -1154,15 +1155,29 @@ async function transcribeYouTubeAudio(videoId: string): Promise<string> {
     logInfo(`[YouTube] Downloading audio for video: ${videoId}`);
     filePath = await downloadYouTubeAudioToTempFile(videoId);
 
+    // Try Gemini first (free tier, multimodal)
+    if (isGeminiConfigured()) {
+      try {
+        logInfo(`[YouTube] Transcribing audio with Gemini for video: ${videoId}`);
+        const text = await transcribeAudioWithGemini(filePath);
+        if (text && text.length >= 10) return text;
+      } catch (geminiErr) {
+        logWarning(`[YouTube] Gemini transcription failed, falling back to Whisper: ${geminiErr instanceof Error ? geminiErr.message : String(geminiErr)}`);
+      }
+    }
+
+    // Whisper fallback
+    if (!isOpenAIConfigured()) {
+      throw new Error('Gemini transcription failed and no OpenAI key configured for Whisper fallback.');
+    }
+
     logInfo(`[YouTube] Transcribing audio with Whisper for video: ${videoId}`);
     const fileStream = fs.createReadStream(filePath);
-
-    // OpenAI accepts a ReadStream directly
     const response = await openai.audio.transcriptions.create({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       file: fileStream as any,
       model: 'whisper-1',
-      language: 'en' // Optional: specify language for better accuracy
+      language: 'en',
     });
 
     const text = (response as unknown as { text?: string }).text?.trim() || '';

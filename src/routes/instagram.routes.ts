@@ -9,6 +9,7 @@
 // ===========================================
 
 import { Router, Request, Response } from 'express';
+import axios from 'axios';
 import multer from 'multer';
 import AdmZip from 'adm-zip';
 import { authenticate, requireCreator } from '../middleware/auth';
@@ -118,7 +119,7 @@ router.get(
     logInfo(`[Instagram] Connected for creator ${creator.id} (IG user ${tokens.instagramUserId})`);
 
     // Kick off background post import
-    setImmediate(() => importInstagramPosts(creator.id, userId, tokens.accessToken).catch(err => {
+    setImmediate(() => importInstagramPosts(creator.id, userId, tokens.accessToken, tokens.instagramUserId).catch(err => {
       logError(err instanceof Error ? err : new Error(String(err)), { context: '[Instagram] Background import failed', creatorId: creator.id });
     }));
 
@@ -161,6 +162,93 @@ router.get(
   })
 );
 
+// ─── GET /api/instagram/debug ─────────────────────────────────────────────────
+// Temporary diagnostic endpoint — tests what the stored token can actually access.
+// Helps distinguish scope issues from endpoint issues.
+// Only available in non-production environments.
+
+router.get(
+  '/debug',
+  authenticate,
+  requireCreator,
+  asyncHandler(async (req: Request, res: Response) => {
+    if (config.nodeEnv === 'production') {
+      return res.status(404).json({ error: 'Not found' });
+    }
+
+    const creator = await prisma.creator.findUnique({
+      where: { userId: req.user!.id },
+      select: { instagramAccessToken: true, instagramUserId: true }
+    });
+
+    if (!creator?.instagramAccessToken) {
+      return res.json({ error: 'Instagram not connected' });
+    }
+
+    const token = creator.instagramAccessToken;
+    const igUserId = creator.instagramUserId;
+    const IG_BASE = 'https://graph.instagram.com/v21.0';
+
+    const tryGet = async (label: string, url: string, extraHeaders?: Record<string, string>) => {
+      try {
+        const r = await axios.get(url, {
+          headers: { Authorization: `Bearer ${token}`, ...extraHeaders },
+          timeout: 10000
+        });
+        return { label, status: r.status, data: r.data };
+      } catch (e: unknown) {
+        const ae = e as { response?: { status?: number; data?: unknown } };
+        return { label, status: ae.response?.status, error: ae.response?.data };
+      }
+    };
+
+    const IG_BASE_PLAIN = 'https://graph.instagram.com';
+    const FB_BASE = 'https://graph.facebook.com/v21.0';
+
+    // Decode what type of token this is from the prefix
+    const prefix = token.slice(0, 8);
+    const tokenType = prefix.startsWith('IGAAR') ? 'Instagram Business Login (IGAAR)'
+      : prefix.startsWith('IGQV') ? 'Instagram Basic Display API (IGQV — DEPRECATED)'
+      : prefix.startsWith('EAA') ? 'Facebook Extended Access Token (EAA)'
+      : `Unknown (prefix: ${prefix})`;
+
+    // ── graph.instagram.com paths ─────────────────────────────────────────────
+    const igResults = await Promise.all([
+      tryGet('ig /me (query param + bearer)', `${IG_BASE}/me?fields=id,username,name,account_type,media_count&access_token=${token}`),
+      tryGet(`ig /${igUserId} (query param + bearer)`, `${IG_BASE}/${igUserId}?fields=id,username,account_type&access_token=${token}`),
+      tryGet(`ig /${igUserId}/media (query param + bearer)`, `${IG_BASE}/${igUserId}/media?fields=id&limit=1&access_token=${token}`),
+      tryGet('ig /me (bearer only)', `${IG_BASE_PLAIN}/v21.0/me?fields=id,username,account_type`),
+      tryGet(`ig /${igUserId}/media (bearer only)`, `${IG_BASE_PLAIN}/v21.0/${igUserId}/media?fields=id&limit=1`),
+    ]);
+
+    // ── graph.facebook.com — get the FB user ID first (may differ from IG user ID) ──
+    const fbMeResult = await tryGet('fb /me', `${FB_BASE}/me?fields=id,name&access_token=${token}`);
+    const fbUserId = (fbMeResult.data as { id?: string } | undefined)?.id ?? null;
+
+    const fbResults = await Promise.all([
+      Promise.resolve(fbMeResult),
+      tryGet('fb /me instagram_business_account', `${FB_BASE}/me?fields=instagram_business_account{id,username,name,account_type}&access_token=${token}`),
+      // Test with the IG user ID (numeric) in case it's the correct FB entity
+      tryGet(`fb /${igUserId}/media`, `${FB_BASE}/${igUserId}/media?fields=id,caption&limit=1&access_token=${token}`),
+      // Test with the Facebook user ID (may be different from IG user ID)
+      ...(fbUserId && fbUserId !== igUserId
+        ? [tryGet(`fb /${fbUserId} (fb user id)`, `${FB_BASE}/${fbUserId}?fields=id,name&access_token=${token}`)]
+        : []
+      ),
+    ]);
+
+    return res.json({
+      instagramUserId: igUserId,
+      facebookUserId: fbUserId,
+      tokenPrefix: token.slice(0, 12) + '...',
+      tokenType,
+      note: 'If all ig/* fail but fb/* succeed → update IG_GRAPH_BASE to graph.facebook.com. If ALL fail → Instagram account must be Business/Creator type (not Personal).',
+      igResults,
+      fbResults,
+    });
+  })
+);
+
 // ─── POST /api/instagram/sync ─────────────────────────────────────────────────
 // Manually re-trigger a post import for the connected account.
 
@@ -185,11 +273,37 @@ router.post(
     }
 
     // Fire off import in background
-    setImmediate(() => importInstagramPosts(creator.id, userId, creator.instagramAccessToken!).catch(err => {
+    setImmediate(() => importInstagramPosts(creator.id, userId, creator.instagramAccessToken!, creator.instagramUserId!).catch(err => {
       logError(err instanceof Error ? err : new Error(String(err)), { context: '[Instagram] Manual sync failed', creatorId: creator.id });
     }));
 
     res.json({ success: true, message: 'Instagram sync started. Posts will appear shortly.' });
+  })
+);
+
+// ─── DELETE /api/instagram/content ───────────────────────────────────────────
+// Removes ALL INSTAGRAM_POST content records for this creator.
+// Used when the creator wants to clear exported/imported data and start fresh.
+
+router.delete(
+  '/content',
+  authenticate,
+  requireCreator,
+  asyncHandler(async (req: Request, res: Response) => {
+    const userId = req.user!.id;
+    const creator = await prisma.creator.findUnique({ where: { userId } });
+    if (!creator) throw new AppError('Creator not found', 404);
+
+    const { count } = await prisma.creatorContent.deleteMany({
+      where: { creatorId: creator.id, type: 'INSTAGRAM_POST' }
+    });
+
+    logInfo(`[Instagram] Cleared ${count} content items for creator ${creator.id}`);
+    res.json({
+      success: true,
+      message: `Removed ${count} Instagram content item${count !== 1 ? 's' : ''}.`,
+      count
+    });
   })
 );
 
@@ -245,37 +359,41 @@ router.post(
       throw new AppError('Invalid ZIP file — please upload your Instagram data export', 400);
     }
 
-    const captions = parseInstagramExportZip(zip);
+    const { items, username } = parseInstagramExportZip(zip);
 
-    if (captions.length === 0) {
+    if (items.length === 0) {
       return res.json({
         success: true,
-        message: 'No post captions found in this export. Make sure you selected "Posts" when requesting your Instagram data.',
-        imported: 0
+        message: 'No content found in this export. Make sure you selected "Posts", "Comments", and "Profile information" when requesting your data, and chose "All time" as the date range.',
+        imported: 0,
+        breakdown: { post: 0, reel: 0, igtv: 0, reply: 0, bio: 0 }
       });
     }
 
-    // Deduplicate against already-imported posts
+    // Deduplicate against already-imported content by raw text (not title —
+    // multiple posts on the same day share a title, so title-based dedup
+    // would both miss same-day posts and fail to block re-uploads correctly).
     const existing = await prisma.creatorContent.findMany({
       where: { creatorId: creator.id, type: 'INSTAGRAM_POST' },
-      select: { title: true }
+      select: { rawText: true }
     });
-    const existingTitles = new Set(existing.map(e => e.title));
+    const existingTexts = new Set(existing.map(e => e.rawText).filter(Boolean) as string[]);
 
+    const breakdown: Record<InstagramContentKind, number> = { post: 0, reel: 0, igtv: 0, reply: 0, bio: 0 };
     let imported = 0;
-    for (const caption of captions) {
-      const title = `Instagram Post — ${new Date(caption.timestamp * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`;
 
-      if (existingTitles.has(title)) continue;
+    for (const item of items) {
+      const title = buildInstagramTitle(item);
+      if (existingTexts.has(item.text)) continue;
 
       const content = await prisma.creatorContent.create({
         data: {
           creatorId: creator.id,
           title,
           type: 'INSTAGRAM_POST',
-          sourceUrl: caption.permalink || null,
+          sourceUrl: item.permalink || null,
           status: 'PROCESSING',
-          rawText: caption.caption
+          rawText: item.text
         }
       });
 
@@ -298,124 +416,299 @@ router.post(
         });
       }
 
+      breakdown[item.kind]++;
       imported++;
     }
 
-    logInfo(`[Instagram Export] Imported ${imported} posts for creator ${creator.id}`);
+    // Human-readable breakdown for the response message
+    const parts: string[] = [];
+    if (breakdown.post  > 0) parts.push(`${breakdown.post} post${breakdown.post !== 1 ? 's' : ''}`);
+    if (breakdown.reel  > 0) parts.push(`${breakdown.reel} reel${breakdown.reel !== 1 ? 's' : ''}`);
+    if (breakdown.igtv  > 0) parts.push(`${breakdown.igtv} IGTV`);
+    if (breakdown.reply > 0) parts.push(`${breakdown.reply} repl${breakdown.reply !== 1 ? 'ies' : 'y'}`);
+    if (breakdown.bio   > 0) parts.push('bio');
+
+    logInfo(`[Instagram Export] Imported ${imported} items for creator ${creator.id} — ${parts.join(', ') || 'none new'}`);
     res.json({
       success: true,
       message: imported > 0
-        ? `${imported} post${imported !== 1 ? 's' : ''} imported and queued for training.`
-        : 'No new posts to import — all captions already exist in your knowledge base.',
+        ? `Imported ${parts.join(', ')} — queued for AI training.`
+        : 'No new content to import — everything already exists in your knowledge base.',
       imported,
-      found: captions.length
+      found: items.length,
+      breakdown,
+      username
     });
   })
 );
 
-// ─── Helper: parse Instagram export ZIP ───────────────────────────────────────
+// ─── Types: parsed Instagram export ──────────────────────────────────────────
 
-interface ParsedCaption {
-  caption: string;
-  timestamp: number;
+type InstagramContentKind = 'post' | 'reel' | 'igtv' | 'reply' | 'bio';
+
+interface ParsedInstagramItem {
+  kind: InstagramContentKind;
+  text: string;
+  timestamp: number;    // Unix seconds; 0 for bio (no date)
   permalink?: string;
+  videoTitle?: string;  // IGTV: used in content title
+}
+
+interface InstagramExportParsed {
+  items: ParsedInstagramItem[];
+  username: string | null;
+}
+
+// ─── Helper: build a human-readable content title ─────────────────────────────
+
+function buildInstagramTitle(item: ParsedInstagramItem): string {
+  const date = item.timestamp
+    ? new Date(item.timestamp * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+    : 'Unknown Date';
+
+  switch (item.kind) {
+    case 'post':  return `Instagram Post — ${date}`;
+    case 'reel':  return `Instagram Reel — ${date}`;
+    case 'igtv':  return item.videoTitle ? `Instagram IGTV — ${item.videoTitle}` : `Instagram IGTV — ${date}`;
+    case 'reply': return `Instagram Reply — ${date}`;
+    case 'bio':   return 'Instagram Bio';
+  }
+}
+
+// ─── Helper: extract Caption / URL / Title from label_values array ────────────
+// Used by posts (new format), reels, and IGTV descriptions.
+
+function extractLabelValues(labelValues: Record<string, unknown>[]): {
+  caption?: string;
+  permalink?: string;
+  title?: string;
+} {
+  const find = (label: string): string | undefined =>
+    (labelValues.find(lv => (lv?.label as string) === label)?.value as string | undefined)?.trim() || undefined;
+
+  return { caption: find('Caption'), permalink: find('URL'), title: find('Title') };
+}
+
+// ─── Helper: safe JSON parse from ZIP entry ───────────────────────────────────
+
+function parseZipEntry(entry: AdmZip.IZipEntry): unknown | null {
+  try {
+    return JSON.parse(entry.getData().toString('utf8'));
+  } catch {
+    logWarning(`[Instagram Export] Could not parse ${entry.entryName} — skipping`);
+    return null;
+  }
 }
 
 /**
- * Extracts post captions from an Instagram data export ZIP.
+ * Extracts all trainable text from an Instagram data export ZIP.
  *
- * Instagram has two export formats depending on when / how the export was requested:
+ * Handles the following content kinds:
+ *   post   — Feed post captions (old + new Accounts Center format)
+ *   reel   — Reel captions
+ *   igtv   — IGTV video descriptions (not subtitles)
+ *   reply  — Creator's own replies on their posts (from post_comments)
+ *   bio    — Creator's profile bio
  *
- * FORMAT A — Old format (exported via Settings → Security → Download Data):
- *   your_instagram_activity/posts/posts_1.json
- *   Each item: { timestamp, media: [{ title: "caption", creation_timestamp, uri }] }
- *   Caption is in media[n].title
+ * Export format variants:
+ *   Old (pre-2024):    your_instagram_activity/posts/posts_N.json
+ *                      caption in media[n].title
+ *   New (2024+):       your_instagram_activity/media/posts(_N)?.json
+ *                      caption in label_values[n].value where label === "Caption"
  *
- * FORMAT B — New Accounts Center format (2024+, exported via Accounts Center):
- *   your_instagram_activity/posts/posts_1.json  OR
- *   your_instagram_activity/media/other_content.json
- *   Each item: { timestamp, media: [], label_values: [{ label: "Caption", value: "caption text" }, { label: "URL", value: "https://..." }] }
- *   Caption is in label_values[n].value where label_values[n].label === "Caption"
- *   URL is in label_values[n].value where label_values[n].label === "URL"
- *
- * This parser handles BOTH formats.
+ * Reels, IGTV, comments follow the same new-format shape.
+ * Personal info provides the username used to filter own-post replies.
  */
-function parseInstagramExportZip(zip: AdmZip): ParsedCaption[] {
-  const results: ParsedCaption[] = [];
-  const seen = new Set<string>(); // deduplicate by caption text
+function parseInstagramExportZip(zip: AdmZip): InstagramExportParsed {
+  const items: ParsedInstagramItem[] = [];
+  const seen = new Set<string>();
+  let username: string | null = null;
+
+  const add = (item: ParsedInstagramItem): void => {
+    if (!item.text) return;
+    const key = `${item.kind}:${item.text}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    items.push(item);
+  };
 
   const entries = zip.getEntries();
 
+  // ── Pass 1: personal info → username + bio ────────────────────────────────
   for (const entry of entries) {
-    const name = entry.entryName;
+    if (!/personal_information\/personal_information\.json$/i.test(entry.entryName)) continue;
 
-    // Feed posts: posts_1.json, posts_2.json, ...
-    const isFeedPost = /your_instagram_activity\/posts\/posts_\d+\.json$/i.test(name);
-    // Reels / other content
-    const isOtherContent = /your_instagram_activity\/media\/other_content\.json$/i.test(name);
+    const data = parseZipEntry(entry) as Record<string, unknown> | null;
+    if (!data) break;
 
-    if (!isFeedPost && !isOtherContent) continue;
-
-    let data: unknown;
-    try {
-      data = JSON.parse(entry.getData().toString('utf8'));
-    } catch {
-      logWarning(`[Instagram Export] Failed to parse ${name}`);
-      continue;
+    const profileUsers = (data?.profile_user as Record<string, unknown>[]) ?? [];
+    for (const profile of profileUsers) {
+      const sm = (profile?.string_map_data as Record<string, Record<string, unknown>>) ?? {};
+      const uname = (sm?.Username?.value as string | undefined)?.trim();
+      if (uname) username = uname;
+      const bio = (sm?.Bio?.value as string | undefined)?.trim();
+      if (bio) add({ kind: 'bio', text: bio, timestamp: 0 });
     }
+    break; // only one personal info file
+  }
 
-    if (!Array.isArray(data)) continue;
+  // ── Pass 2: posts, reels, IGTV, comments ─────────────────────────────────
+  for (const entry of entries) {
+    const n = entry.entryName;
 
-    for (const post of data as Record<string, unknown>[]) {
-      const postTimestamp: number = (post?.timestamp as number) ?? 0;
+    // ── Feed posts — old format ─────────────────────────────────────────────
+    if (/your_instagram_activity\/posts\/posts_\d+\.json$/i.test(n)) {
+      const data = parseZipEntry(entry);
+      if (!Array.isArray(data)) continue;
 
-      // ── FORMAT A: caption in media[n].title ──────────────────────────────
-      const mediaItems = (post?.media as Record<string, unknown>[]) ?? [];
-      for (const item of mediaItems) {
-        const caption = (item?.title as string | undefined)?.trim();
-        if (!caption || seen.has(caption)) continue;
-        seen.add(caption);
-        const ts: number = (item?.creation_timestamp as number) ?? postTimestamp;
-        results.push({ caption, timestamp: ts || postTimestamp });
-      }
+      for (const post of data as Record<string, unknown>[]) {
+        const ts: number = (post?.timestamp as number) ?? 0;
 
-      // ── FORMAT B: caption in label_values[n].value where label === "Caption" ──
-      const labelValues = (post?.label_values as Record<string, unknown>[]) ?? [];
-      if (labelValues.length > 0) {
-        // Find caption value
-        const captionEntry = labelValues.find(lv => (lv?.label as string) === 'Caption');
-        const caption = (captionEntry?.value as string | undefined)?.trim();
-
-        if (caption && !seen.has(caption)) {
-          seen.add(caption);
-          // Find URL value (permalink)
-          const urlEntry = labelValues.find(lv => (lv?.label as string) === 'URL');
-          const permalink = (urlEntry?.value as string | undefined) || undefined;
-          results.push({ caption, timestamp: postTimestamp, permalink });
+        // Old format: caption in media[n].title
+        for (const item of (post?.media as Record<string, unknown>[]) ?? []) {
+          const caption = (item?.title as string | undefined)?.trim();
+          if (caption) add({ kind: 'post', text: caption, timestamp: (item?.creation_timestamp as number) ?? ts });
         }
 
-        // Also check nested label_values inside label_values (some exports nest them)
-        for (const lv of labelValues) {
-          const nested = (lv?.label_values as Record<string, unknown>[]) ?? [];
-          const nestedCaption = nested.find(n => (n?.label as string) === 'Caption');
-          const cap = (nestedCaption?.value as string | undefined)?.trim();
-          if (cap && !seen.has(cap)) {
-            seen.add(cap);
-            results.push({ caption: cap, timestamp: postTimestamp });
+        // New format embedded in old-path file: label_values
+        const lvs = (post?.label_values as Record<string, unknown>[]) ?? [];
+        if (lvs.length > 0) {
+          const { caption, permalink } = extractLabelValues(lvs);
+          if (caption) add({ kind: 'post', text: caption, timestamp: ts, permalink });
+
+          // Some exports nest label_values inside label_values
+          for (const lv of lvs) {
+            const nested = (lv?.label_values as Record<string, unknown>[]) ?? [];
+            if (nested.length > 0) {
+              const { caption: nc } = extractLabelValues(nested);
+              if (nc) add({ kind: 'post', text: nc, timestamp: ts });
+            }
           }
         }
       }
+      continue;
+    }
+
+    // ── Feed posts — new Accounts Center format ─────────────────────────────
+    if (/your_instagram_activity\/media\/posts(_\d+)?\.json$/i.test(n)) {
+      const data = parseZipEntry(entry);
+      if (!Array.isArray(data)) continue;
+
+      for (const post of data as Record<string, unknown>[]) {
+        const ts: number = (post?.timestamp as number) ?? 0;
+        const lvs = (post?.label_values as Record<string, unknown>[]) ?? [];
+
+        if (lvs.length > 0) {
+          const { caption, permalink } = extractLabelValues(lvs);
+          if (caption) add({ kind: 'post', text: caption, timestamp: ts, permalink });
+
+          for (const lv of lvs) {
+            const nested = (lv?.label_values as Record<string, unknown>[]) ?? [];
+            if (nested.length > 0) {
+              const { caption: nc } = extractLabelValues(nested);
+              if (nc) add({ kind: 'post', text: nc, timestamp: ts });
+            }
+          }
+        }
+
+        // Fallback: media[n].title (in case new-path file uses old shape)
+        for (const item of (post?.media as Record<string, unknown>[]) ?? []) {
+          const caption = (item?.title as string | undefined)?.trim();
+          if (caption) add({ kind: 'post', text: caption, timestamp: (item?.creation_timestamp as number) ?? ts });
+        }
+      }
+      continue;
+    }
+
+    // ── Reels ───────────────────────────────────────────────────────────────
+    if (/your_instagram_activity\/media\/reels(_\d+)?\.json$/i.test(n)) {
+      const data = parseZipEntry(entry);
+      if (!Array.isArray(data)) continue;
+
+      for (const reel of data as Record<string, unknown>[]) {
+        const ts: number = (reel?.timestamp as number) ?? 0;
+
+        const lvs = (reel?.label_values as Record<string, unknown>[]) ?? [];
+        if (lvs.length > 0) {
+          const { caption, permalink } = extractLabelValues(lvs);
+          if (caption) add({ kind: 'reel', text: caption, timestamp: ts, permalink });
+        }
+
+        // Old format fallback
+        for (const item of (reel?.media as Record<string, unknown>[]) ?? []) {
+          const caption = (item?.title as string | undefined)?.trim();
+          if (caption) add({ kind: 'reel', text: caption, timestamp: (item?.creation_timestamp as number) ?? ts });
+        }
+      }
+      continue;
+    }
+
+    // ── IGTV descriptions ───────────────────────────────────────────────────
+    // We extract the video description (Caption), NOT the subtitle/SRT content.
+    // Subtitle SRT files are intentionally skipped as they often contain song lyrics.
+    if (/your_instagram_activity\/media\/igtv_videos(_\d+)?\.json$/i.test(n)) {
+      const raw = parseZipEntry(entry);
+      // Some exports wrap the list in { ig_igtv_media: [...] }
+      const data: unknown = Array.isArray(raw)
+        ? raw
+        : (raw as Record<string, unknown>)?.ig_igtv_media ?? null;
+      if (!Array.isArray(data)) continue;
+
+      for (const video of data as Record<string, unknown>[]) {
+        const ts: number = (video?.timestamp as number) ?? 0;
+
+        // New format: description in label_values Caption
+        const lvs = (video?.label_values as Record<string, unknown>[]) ?? [];
+        if (lvs.length > 0) {
+          const { caption, permalink, title: videoTitle } = extractLabelValues(lvs);
+          if (caption) add({ kind: 'igtv', text: caption, timestamp: ts, permalink, videoTitle });
+        }
+        // Old format: media[n].title is the video title only (no description field) — skip
+      }
+      continue;
+    }
+
+    // ── Comments / own-post replies ─────────────────────────────────────────
+    // Filters to entries where Media Owner = creator's username (own-post replies).
+    // If username could not be determined, imports all comments.
+    if (/your_instagram_activity\/comments\/post_comments_\d+\.json$/i.test(n)) {
+      const data = parseZipEntry(entry);
+      if (!Array.isArray(data)) continue;
+
+      for (const comment of data as Record<string, unknown>[]) {
+        const sm = (comment?.string_map_data as Record<string, Record<string, unknown>>) ?? {};
+        const text = (sm?.Comment?.value as string | undefined)?.trim();
+        const ts: number = (sm?.Comment?.timestamp as number) ?? 0;
+        const mediaOwner = (sm?.['Media Owner']?.value as string | undefined)?.trim();
+
+        if (!text) continue;
+
+        // post_comments_1.json contains comments the CREATOR wrote (their own words),
+        // regardless of whose post they appear on. Import all of them.
+        // If username is known, we additionally flag own-post replies — but either
+        // way the text represents the creator's voice so we always import it.
+        add({ kind: 'reply', text, timestamp: ts });
+      }
+      continue;
     }
   }
 
-  logInfo(`[Instagram Export] Extracted ${results.length} captions from ZIP`);
-  return results;
+  const counts = {
+    post:  items.filter(i => i.kind === 'post').length,
+    reel:  items.filter(i => i.kind === 'reel').length,
+    igtv:  items.filter(i => i.kind === 'igtv').length,
+    reply: items.filter(i => i.kind === 'reply').length,
+    bio:   items.filter(i => i.kind === 'bio').length,
+  };
+  logInfo(`[Instagram Export] Parsed — posts:${counts.post} reels:${counts.reel} igtv:${counts.igtv} replies:${counts.reply} bio:${counts.bio} username:${username ?? 'unknown'}`);
+
+  return { items, username };
 }
 
 // ─── Helper: import posts as CreatorContent ────────────────────────────────────
 
-async function importInstagramPosts(creatorId: string, userId: string, accessToken: string) {
-  const posts = await fetchRecentPostCaptions(accessToken, 50);
+async function importInstagramPosts(creatorId: string, userId: string, accessToken: string, instagramUserId: string) {
+  const posts = await fetchRecentPostCaptions(accessToken, instagramUserId, 50);
 
   if (posts.length === 0) {
     logInfo(`[Instagram] No posts with captions found for creator ${creatorId}`);

@@ -278,17 +278,14 @@ router.get('/debug-rag', async (req, res) => {
 
 // ========================
 // VOICE CLONE — must be before /:contentId routes
-// Primary: Inworld (multi-sample cloning — up to 3 clips for best quality).
-// Fallback: Chatterbox (free, Modal GPU, single-file zero-shot clone).
-// ElevenLabs is kept for TTS playback only — not used for cloning.
+// Uses Inworld TTS-1.5 Mini for voice cloning and all TTS generation.
 // ========================
 
 // Clone voice from up to 3 audio samples.
 // More diverse samples → better voice quality (different emotions, pacing, phonemes).
 router.post('/voice-clone', uploadVoiceAudioMulti, async (req, res) => {
   try {
-    const chatterboxSvc = require('../services/voice/chatterbox.service');
-    const inworldSvc    = require('../services/voice/inworld.service');
+    const inworldSvc = require('../services/voice/inworld.service');
 
     const creatorId = req.user?.creator?.id;
     if (!creatorId) return res.status(400).json({ success: false, error: { message: 'Creator profile not found' } });
@@ -303,25 +300,23 @@ router.post('/voice-clone', uploadVoiceAudioMulti, async (req, res) => {
     }
 
     // Reject suspiciously small files — likely empty recordings or corrupt uploads
-    // ~10 KB is a very rough floor; real speech at any bitrate exceeds this easily
     const MIN_BYTES = 10 * 1024;
     const tooSmall  = files.filter(f => f.size < MIN_BYTES);
     if (tooSmall.length) {
       return res.status(400).json({ success: false, error: { message: `${tooSmall.map(f => f.originalname).join(', ')} — file too small. Minimum 15 seconds of speech required.` } });
     }
 
-    const filePaths       = files.map(f => f.path);
-    const firstPath       = filePaths[0]; // Chatterbox: single-file zero-shot clone
-    const inworldPaths    = filePaths.slice(0, 3); // Inworld recommends max 3 diverse samples
+    const filePaths    = files.map(f => f.path);
+    const inworldPaths = filePaths.slice(0, 3); // Inworld recommends max 3 diverse samples
 
     const existing = await prisma.creator.findUnique({
-      where: { id: creatorId },
-      select: { displayName: true, voiceIdChatterbox: true, voiceIdInworld: true },
+      where:  { id: creatorId },
+      select: { displayName: true, voiceIdInworld: true },
     });
 
     await prisma.creator.update({
       where: { id: creatorId },
-      data: { voiceStatus: 'PROCESSING', voiceProvider: 'inworld' },
+      data:  { voiceStatus: 'PROCESSING' },
     });
 
     // Clean up old Inworld voice before replacing (remote state in their system)
@@ -331,35 +326,17 @@ router.post('/voice-clone', uploadVoiceAudioMulti, async (req, res) => {
 
     const name = `${existing?.displayName || 'Creator'} Voice`;
 
-    // Clone on Inworld (primary) and Chatterbox (fallback) simultaneously.
-    // Inworld receives ALL samples — more samples = better result.
-    // Chatterbox receives only the first file (zero-shot, single reference).
-    const [inworldRes, chatterboxRes] = await Promise.allSettled([
-      inworldSvc.isConfigured()
-        ? inworldSvc.cloneVoice(name, inworldPaths)
-        : Promise.reject(new Error('Inworld not configured')),
-      chatterboxSvc.isConfigured()
-        ? chatterboxSvc.cloneVoice(name, firstPath)
-        : Promise.reject(new Error('Chatterbox not configured')),
-    ]);
-
-    const voiceIdInworld    = inworldRes.status    === 'fulfilled' ? inworldRes.value    : null;
-    const voiceIdChatterbox = chatterboxRes.status === 'fulfilled' ? chatterboxRes.value : null;
-
-    // Prefer Inworld; fall back to Chatterbox if Inworld failed
-    const effectiveId       = voiceIdInworld || voiceIdChatterbox;
-    const effectiveProvider = voiceIdInworld ? 'inworld' : (voiceIdChatterbox ? 'chatterbox' : null);
-
-    if (!effectiveId || !effectiveProvider) {
-      const errMsg = inworldRes.status === 'rejected'
-        ? (inworldRes.reason instanceof Error ? inworldRes.reason.message : String(inworldRes.reason))
-        : 'Voice clone failed';
+    let voiceIdInworld: string | null = null;
+    try {
+      if (!inworldSvc.isConfigured()) throw new Error('Inworld not configured — add INWORLD_API_KEY to your environment');
+      voiceIdInworld = await inworldSvc.cloneVoice(name, inworldPaths);
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
       await prisma.creator.update({ where: { id: creatorId }, data: { voiceStatus: 'FAILED' } }).catch(() => {});
       return res.status(500).json({ success: false, error: { message: errMsg } });
     }
 
     // Build persistent URLs for each uploaded sample.
-    // Wrapped in try/catch — a URL-building failure must never cancel a successful voice clone.
     type VoiceSampleMeta = { id: string; name: string; url: string; duration: number; createdAt: string };
     let voiceSamples: VoiceSampleMeta[] = [];
     try {
@@ -373,7 +350,6 @@ router.post('/voice-clone', uploadVoiceAudioMulti, async (req, res) => {
             url = buildUploadUrl(`chat/${file.filename}`);
           }
         } catch {
-          // Fall back to local path so the sample is still recorded
           url = buildUploadUrl(`chat/${file.filename}`);
         }
         return {
@@ -391,12 +367,9 @@ router.post('/voice-clone', uploadVoiceAudioMulti, async (req, res) => {
     await prisma.creator.update({
       where: { id: creatorId },
       data: {
-        voiceId:          effectiveId,
+        voiceId:       voiceIdInworld,
         voiceIdInworld,
-        voiceIdChatterbox,
-        voiceIdElevenlabs: null, // ElevenLabs no longer used for cloning
-        voiceStatus:      'READY',
-        voiceProvider:    effectiveProvider,
+        voiceStatus:   'READY',
         voiceSamples,
       },
     });
@@ -404,15 +377,10 @@ router.post('/voice-clone', uploadVoiceAudioMulti, async (req, res) => {
     res.json({
       success: true,
       data: {
-        voiceId:       effectiveId,
-        status:        'READY',
-        voiceProvider: effectiveProvider,
-        sampleCount:   filePaths.length,
+        voiceId:     voiceIdInworld,
+        status:      'READY',
+        sampleCount: filePaths.length,
         voiceSamples,
-        providers: {
-          inworld:    !!voiceIdInworld,
-          chatterbox: !!voiceIdChatterbox,
-        },
       },
     });
   } catch (err: unknown) {
@@ -434,53 +402,36 @@ router.post('/voice-preview', async (req, res) => {
     const [creator, prosodyRows] = await Promise.all([
       prisma.creator.findUnique({
         where:  { id: creatorId },
-        select: { voiceIdInworld: true, voiceIdChatterbox: true, voiceProvider: true, displayName: true },
+        select: { voiceIdInworld: true, displayName: true },
       }),
       prisma.$queryRaw<Array<{ voiceSpeakingRate: number | null; voicePitch: number | null }>>`
         SELECT "voiceSpeakingRate", "voicePitch" FROM "Creator" WHERE id::text = ${creatorId}
       `,
     ]);
-    const creatorVoice = { ...creator, ...prosodyRows[0] };
+    const prosody = prosodyRows[0];
 
-    const voiceId = creator?.voiceIdInworld || creator?.voiceIdChatterbox;
-    if (!voiceId) {
+    if (!creator?.voiceIdInworld) {
       return res.status(400).json({ success: false, error: { message: 'No voice clone found. Clone your voice first.' } });
     }
 
-    const name         = creator?.displayName || 'there';
-    const previewText  = `Hey, it's ${name}! Your AI voice clone is ready. Every response will now sound just like this — powered by your real voice.`;
-    const inworldSvc   = require('../services/voice/inworld.service');
-    const chatterboxSvc = require('../services/voice/chatterbox.service');
+    const name        = creator?.displayName || 'there';
+    const previewText = `Hey, it's ${name}! Your AI voice clone is ready. Every response will now sound just like this — powered by your real voice.`;
+    const inworldSvc  = require('../services/voice/inworld.service');
 
-    // Try each configured provider in order; on failure fall through to null
     let audioUrl: string | null = null;
     let previewError: string | null = null;
 
-    if (creator?.voiceIdInworld && inworldSvc.isConfigured()) {
-      try {
-        const audioPath = await inworldSvc.textToSpeech(creator.voiceIdInworld, previewText, {
-          speakingRate: creatorVoice.voiceSpeakingRate ?? undefined,
-          pitch:        creatorVoice.voicePitch        ?? undefined,
-        });
-        const baseUrl   = process.env.API_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 5000}`;
-        audioUrl = audioPath.startsWith('http') ? audioPath : `${baseUrl}/uploads/${audioPath}`;
-      } catch (ttsErr: unknown) {
-        previewError = ttsErr instanceof Error ? ttsErr.message : String(ttsErr);
-        console.error('[voice-preview] Inworld TTS failed:', previewError);
-      }
-    }
-
-    if (!audioUrl && creator?.voiceIdChatterbox && chatterboxSvc.isConfigured()) {
-      try {
-        const audioPath = await chatterboxSvc.textToSpeech(creator.voiceIdChatterbox, previewText);
-        const baseUrl   = process.env.API_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 5000}`;
-        audioUrl = audioPath.startsWith('http') ? audioPath : `${baseUrl}/uploads/${audioPath}`;
-        previewError = null; // chatterbox succeeded, clear the error
-      } catch (ttsErr: unknown) {
-        const cbErr = ttsErr instanceof Error ? ttsErr.message : String(ttsErr);
-        previewError = previewError ? `${previewError} | Chatterbox: ${cbErr}` : cbErr;
-        console.error('[voice-preview] Chatterbox TTS failed:', cbErr);
-      }
+    try {
+      if (!inworldSvc.isConfigured()) throw new Error('Inworld not configured');
+      const audioPath = await inworldSvc.textToSpeech(creator.voiceIdInworld, previewText, {
+        speakingRate: prosody?.voiceSpeakingRate ?? undefined,
+        pitch:        prosody?.voicePitch        ?? undefined,
+      });
+      const baseUrl = process.env.API_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 5000}`;
+      audioUrl = audioPath.startsWith('http') ? audioPath : `${baseUrl}/uploads/${audioPath}`;
+    } catch (ttsErr: unknown) {
+      previewError = ttsErr instanceof Error ? ttsErr.message : String(ttsErr);
+      console.error('[voice-preview] Inworld TTS failed:', previewError);
     }
 
     // Always return 200 — null audioUrl means preview is unavailable
@@ -499,15 +450,12 @@ router.get('/voice-clone', async (req, res) => {
 
     const [creator, prosodyRows] = await Promise.all([
       prisma.creator.findUnique({
-        where: { id: creatorId },
+        where:  { id: creatorId },
         select: {
-          voiceId: true,
-          voiceIdChatterbox: true,
+          voiceId:       true,
           voiceIdInworld: true,
-          voiceIdElevenlabs: true,
-          voiceStatus: true,
-          voiceProvider: true,
-          voiceSamples: true,
+          voiceStatus:   true,
+          voiceSamples:  true,
         },
       }),
       prisma.$queryRaw<Array<{ voiceSpeakingRate: number | null; voicePitch: number | null }>>`
@@ -519,17 +467,11 @@ router.get('/voice-clone', async (req, res) => {
     res.json({
       success: true,
       data: {
-        voiceId:       creator?.voiceId,
-        status:        creator?.voiceStatus,
-        voiceProvider: creator?.voiceProvider || 'inworld',
-        voiceSamples:  (creator?.voiceSamples ?? []) as Array<{ id: string; name: string; url: string; duration: number; createdAt: string }>,
-        speakingRate:  prosody?.voiceSpeakingRate ?? null,
-        pitch:         prosody?.voicePitch        ?? null,
-        providers: {
-          chatterbox: !!creator?.voiceIdChatterbox,
-          inworld:    !!creator?.voiceIdInworld,
-          elevenlabs: !!creator?.voiceIdElevenlabs,
-        },
+        voiceId:      creator?.voiceId,
+        status:       creator?.voiceStatus,
+        voiceSamples: (creator?.voiceSamples ?? []) as Array<{ id: string; name: string; url: string; duration: number; createdAt: string }>,
+        speakingRate: prosody?.voiceSpeakingRate ?? null,
+        pitch:        prosody?.voicePitch        ?? null,
       },
     });
   } catch (err: unknown) {
@@ -627,25 +569,22 @@ router.delete('/voice-clone', async (req, res) => {
     if (!creatorId) return res.status(400).json({ success: false, error: { message: 'Creator profile not found' } });
 
     const creator = await prisma.creator.findUnique({
-      where: { id: creatorId },
-      select: { voiceIdChatterbox: true, voiceIdInworld: true, voiceIdElevenlabs: true },
+      where:  { id: creatorId },
+      select: { voiceIdInworld: true },
     });
 
-    const elevenlabsSvc = require('../services/voice/elevenlabs.service');
-
-    if (creator?.voiceIdElevenlabs && elevenlabsSvc.isConfigured()) {
-      await elevenlabsSvc.deleteVoice(creator.voiceIdElevenlabs).catch(() => {});
+    const inworldSvc = require('../services/voice/inworld.service');
+    if (creator?.voiceIdInworld && inworldSvc.isConfigured()) {
+      await inworldSvc.deleteVoice(creator.voiceIdInworld).catch(() => {});
     }
 
     await prisma.creator.update({
       where: { id: creatorId },
       data: {
-        voiceId: null,
-        voiceIdChatterbox: null,
+        voiceId:       null,
         voiceIdInworld: null,
-        voiceIdElevenlabs: null,
-        voiceStatus: null,
-        voiceSamples: [],
+        voiceStatus:   null,
+        voiceSamples:  [],
       },
     });
 

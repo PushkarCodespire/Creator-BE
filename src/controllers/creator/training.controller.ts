@@ -9,7 +9,7 @@ import { asyncHandler, AppError } from '../../middleware/errorHandler';
 import prisma from '../../../prisma/client';
 import { triggerCreatorFineTune, syncFineTuneStatus } from '../../services/ai/fine-tune.service';
 import { invalidateCorrectionsCache } from '../chat.controller';
-import { generateEmbedding, isOpenAIConfigured } from '../../utils/openai';
+import { generateEmbedding, isOpenAIConfigured, isAIConfigured } from '../../utils/openai';
 import { storeVector, deleteVectorsByContent, vectorExists } from '../../utils/vectorStore';
 
 // Store a correction in the vector store so RAG can retrieve it.
@@ -21,7 +21,7 @@ async function indexCorrectionVector(
   userMessage: string,
   chosenResponse: string
 ): Promise<void> {
-  if (!isOpenAIConfigured()) return;
+  if (!isAIConfigured()) return;
   const embedding = await generateEmbedding(userMessage);
   storeVector({
     id:        correctionId,
@@ -193,7 +193,7 @@ export const startFineTune = asyncHandler(async (req: AuthRequest, res: Response
 
 // ── Startup backfill: index any active corrections not yet in the vector store ─
 export async function backfillCorrectionVectors(): Promise<void> {
-  if (!isOpenAIConfigured()) return;
+  if (!isAIConfigured()) return;
 
   const corrections = await prisma.messageCorrection.findMany({
     where: { isActive: true },

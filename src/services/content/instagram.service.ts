@@ -14,8 +14,16 @@ const IG_TOKEN_URL = 'https://api.instagram.com/oauth/access_token';
 const IG_LONG_TOKEN_URL = 'https://graph.instagram.com/access_token';
 const IG_GRAPH_BASE = 'https://graph.instagram.com/v21.0';
 
-/** Scopes required for reading posts */
-const SCOPES = ['instagram_business_basic', 'instagram_business_manage_messages'].join(',');
+/**
+ * instagram_business_basic is the only scope needed to read post captions and media.
+ * The other instagram_business_* scopes (manage_messages, manage_comments,
+ * content_publish, manage_insights) require Meta App Review (Advanced Access).
+ * Requesting unapproved advanced scopes in a Live app causes the token to be
+ * issued in a broken state where all graph.instagram.com calls return
+ * "Unsupported request - method type: get" — even for /me.
+ * Until those scopes are approved through App Review, request only the base scope.
+ */
+const SCOPES = 'instagram_business_basic';
 
 // ─── State token (short-lived JWT encoding userId) ───────────────────────────
 
@@ -42,6 +50,13 @@ export function verifyStateToken(state: string): string {
 export function buildAuthUrl(userId: string): string {
   const state = generateStateToken(userId);
   const params = new URLSearchParams({
+    // enable_fb_login=0 forces Instagram credentials (not Facebook login).
+    // Without this, Meta lets users authenticate via Facebook session, which
+    // produces a Facebook-session-backed IGAAR token that graph.instagram.com
+    // rejects for all data calls ("Unsupported request - method type: get").
+    // Meta's own "API setup with Instagram login" embed URL always includes this.
+    enable_fb_login: '0',
+    force_authentication: '1',
     client_id: config.instagram.clientId,
     redirect_uri: config.instagram.redirectUri,
     scope: SCOPES,
@@ -79,33 +94,113 @@ export async function exchangeCodeForTokens(code: string): Promise<{
     code
   });
 
-  logInfo('[Instagram] Exchanging authorization code for short-lived token');
-  const shortRes = await axios.post<ShortLivedToken>(IG_TOKEN_URL, form.toString(), {
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    timeout: 15000
-  });
+  logInfo(`[Instagram] Exchanging code — client_id=${config.instagram.clientId} redirect_uri=${config.instagram.redirectUri}`);
+  let shortRes;
+  try {
+    shortRes = await axios.post<ShortLivedToken>(IG_TOKEN_URL, form.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 15000
+    });
+  } catch (err: unknown) {
+    const axiosErr = err as { response?: { data?: unknown; status?: number } };
+    logError(new Error(`[Instagram] Token exchange HTTP error: status=${axiosErr?.response?.status} body=${JSON.stringify(axiosErr?.response?.data)}`), { context: '[Instagram] short-lived token' });
+    throw err;
+  }
 
   const shortToken = shortRes.data.access_token;
   const instagramUserId = String(shortRes.data.user_id);
+  logInfo(`[Instagram] Short-lived token obtained for IG user ${instagramUserId} (prefix: ${shortToken.slice(0, 8)}...)`);
 
-  // 2. Long-lived token (GET /access_token)
-  logInfo('[Instagram] Upgrading to long-lived token');
-  const longRes = await axios.get<LongLivedToken>(IG_LONG_TOKEN_URL, {
-    params: {
-      grant_type: 'ig_exchange_token',
-      client_secret: config.instagram.clientSecret,
-      access_token: shortToken
-    },
-    timeout: 15000
+  // 2. Exchange short-lived (1h) for long-lived token (60 days).
+  // Required: graph.instagram.com data endpoints reject short-lived tokens.
+  let accessToken = shortToken;
+  let expiresAt = new Date(Date.now() + 60 * 60 * 1000); // fallback: 1 hour
+
+  // Try POST first (Instagram Business Login API may require POST, not GET).
+  // The GET form is documented but returns "Unsupported request - method type: get"
+  // for IGAAR-type tokens, so we try both.
+  const exchangeParams = new URLSearchParams({
+    grant_type: 'ig_exchange_token',
+    client_id: config.instagram.clientId,
+    client_secret: config.instagram.clientSecret,
+    access_token: shortToken
   });
 
-  const expiresAt = new Date(Date.now() + longRes.data.expires_in * 1000);
+  let exchangeSucceeded = false;
 
-  return {
-    accessToken: longRes.data.access_token,
-    instagramUserId,
-    expiresAt
-  };
+  // Attempt 1: POST (form-encoded)
+  try {
+    const longRes = await axios.post<LongLivedToken>(IG_LONG_TOKEN_URL, exchangeParams.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 15000
+    });
+    accessToken = longRes.data.access_token;
+    expiresAt = new Date(Date.now() + longRes.data.expires_in * 1000);
+    logInfo(`[Instagram] Long-lived token obtained via POST — expires in ${Math.round(longRes.data.expires_in / 86400)}d (prefix: ${accessToken.slice(0, 8)}...)`);
+    exchangeSucceeded = true;
+  } catch (postErr: unknown) {
+    const ae = postErr as { response?: { data?: unknown; status?: number } };
+    logWarning(`[Instagram] POST exchange failed: status=${ae?.response?.status} body=${JSON.stringify(ae?.response?.data)} — trying GET`);
+  }
+
+  // Attempt 2: GET (documented form)
+  if (!exchangeSucceeded) {
+    try {
+      const longRes = await axios.get<LongLivedToken>(IG_LONG_TOKEN_URL, {
+        params: {
+          grant_type: 'ig_exchange_token',
+          client_id: config.instagram.clientId,
+          client_secret: config.instagram.clientSecret,
+          access_token: shortToken
+        },
+        timeout: 15000
+      });
+      accessToken = longRes.data.access_token;
+      expiresAt = new Date(Date.now() + longRes.data.expires_in * 1000);
+      logInfo(`[Instagram] Long-lived token obtained via GET — expires in ${Math.round(longRes.data.expires_in / 86400)}d (prefix: ${accessToken.slice(0, 8)}...)`);
+      exchangeSucceeded = true;
+    } catch (getErr: unknown) {
+      const ae = getErr as { response?: { data?: unknown; status?: number } };
+      logWarning(`[Instagram] GET exchange failed: status=${ae?.response?.status} body=${JSON.stringify(ae?.response?.data)} — trying Facebook exchange`);
+    }
+  }
+
+  // Attempt 3: Facebook Graph API exchange using parent Facebook App credentials.
+  // Apps configured with "Facebook Login for Business" + Instagram permissions may issue
+  // IGAAR tokens whose long-lived exchange endpoint is graph.facebook.com, not
+  // graph.instagram.com.  Uses fb_exchange_token grant with the Facebook App ID/secret.
+  if (!exchangeSucceeded && config.instagram.facebookAppId && config.instagram.facebookAppSecret) {
+    try {
+      const longRes = await axios.get<LongLivedToken>('https://graph.facebook.com/oauth/access_token', {
+        params: {
+          grant_type: 'fb_exchange_token',
+          client_id: config.instagram.facebookAppId,
+          client_secret: config.instagram.facebookAppSecret,
+          access_token: shortToken
+        },
+        timeout: 15000
+      });
+      accessToken = longRes.data.access_token;
+      expiresAt = new Date(Date.now() + longRes.data.expires_in * 1000);
+      logInfo(`[Instagram] Long-lived token obtained via Facebook exchange — expires in ${Math.round(longRes.data.expires_in / 86400)}d (prefix: ${accessToken.slice(0, 8)}...)`);
+      exchangeSucceeded = true;
+    } catch (fbErr: unknown) {
+      const ae = fbErr as { response?: { data?: unknown; status?: number } };
+      logError(
+        new Error(`[Instagram] Long-lived token exchange failed (POST, GET, and Facebook): status=${ae?.response?.status} body=${JSON.stringify(ae?.response?.data)}`),
+        { context: '[Instagram] long-lived token exchange' }
+      );
+      logWarning('[Instagram] Falling back to short-lived token (1h) — reconnect required within the hour, and account must be Instagram Business/Creator type');
+    }
+  } else if (!exchangeSucceeded) {
+    logError(
+      new Error('[Instagram] Long-lived token exchange failed (POST and GET) and Facebook App credentials are not configured'),
+      { context: '[Instagram] long-lived token exchange' }
+    );
+    logWarning('[Instagram] Falling back to short-lived token — data API calls will likely fail');
+  }
+
+  return { accessToken, instagramUserId, expiresAt };
 }
 
 // ─── Media fetching ───────────────────────────────────────────────────────────
@@ -126,37 +221,86 @@ interface IgMediaResponse {
 /**
  * Fetch recent media items (up to maxPosts) that have a caption.
  * Stops when it has collected enough or the API has no more pages.
+ *
+ * Tries graph.instagram.com first (correct for Instagram Business Login tokens).
+ * Falls back to graph.facebook.com if the Instagram endpoint rejects the request —
+ * this covers apps configured with Facebook Login for Business + Instagram permissions,
+ * where the token may only be accepted on the Facebook Graph API.
+ *
+ * The Instagram user ID is used in the path (/{id}/media) rather than /me/media
+ * because Business Login tokens do not resolve /me on graph.instagram.com.
  */
 export async function fetchRecentPostCaptions(
   accessToken: string,
+  instagramUserId: string,
   maxPosts = 50
 ): Promise<Array<{ id: string; caption: string; timestamp: string; permalink?: string }>> {
+
+  // Determine which base URL to use: try IG first, fall back to FB.
+  const candidates = [
+    `${IG_GRAPH_BASE}/${instagramUserId}/media`,
+    `https://graph.facebook.com/v21.0/${instagramUserId}/media`,
+  ];
+
   const results: Array<{ id: string; caption: string; timestamp: string; permalink?: string }> = [];
-  let url: string | null =
-    `${IG_GRAPH_BASE}/me/media?fields=id,caption,media_type,timestamp,permalink&limit=25&access_token=${accessToken}`;
+  let lastError: unknown = null;
 
-  while (url && results.length < maxPosts) {
-    logInfo(`[Instagram] Fetching media page (collected ${results.length} so far)`);
-    const currentUrl: string = url;
-    const res: { data: IgMediaResponse } = await axios.get<IgMediaResponse>(currentUrl, { timeout: 15000 });
-    const items = res.data.data ?? [];
+  for (const baseMediaUrl of candidates) {
+    const domain = baseMediaUrl.includes('graph.facebook.com') ? 'facebook' : 'instagram';
+    logInfo(`[Instagram] Starting media fetch via ${domain} — igUserId=${instagramUserId}`);
 
-    for (const item of items) {
-      if (item.caption && item.caption.trim()) {
-        results.push({
-          id: item.id,
-          caption: item.caption.trim(),
-          timestamp: item.timestamp,
-          permalink: item.permalink
+    let url: string | null =
+      `${baseMediaUrl}?fields=id,caption,media_type,timestamp,permalink&limit=25&access_token=${accessToken}`;
+
+    let pagesFetched = 0;
+    let domainFailed = false;
+
+    while (url && results.length < maxPosts) {
+      logInfo(`[Instagram] Fetching media page via ${domain} (collected ${results.length} so far)`);
+      const currentUrl: string = url;
+      let res: { data: IgMediaResponse };
+      try {
+        res = await axios.get<IgMediaResponse>(currentUrl, {
+          headers: { Authorization: `Bearer ${accessToken}` },
+          timeout: 15000
         });
+      } catch (err: unknown) {
+        const axiosErr = err as { response?: { data?: unknown; status?: number } };
+        logError(new Error(`[Instagram] Media fetch error via ${domain}: status=${axiosErr?.response?.status} body=${JSON.stringify(axiosErr?.response?.data)}`), { context: `[Instagram] media fetch (${domain})` });
+        lastError = err;
+        domainFailed = true;
+        break;
       }
-      if (results.length >= maxPosts) break;
+
+      pagesFetched++;
+      const items = res.data.data ?? [];
+
+      for (const item of items) {
+        if (item.caption && item.caption.trim()) {
+          results.push({
+            id: item.id,
+            caption: item.caption.trim(),
+            timestamp: item.timestamp,
+            permalink: item.permalink
+          });
+        }
+        if (results.length >= maxPosts) break;
+      }
+
+      url = res.data.paging?.next ?? null;
     }
 
-    url = res.data.paging?.next ?? null;
+    if (!domainFailed) {
+      logInfo(`[Instagram] Fetched ${results.length} posts with captions via ${domain}`);
+      return results; // Success — stop trying other domains
+    }
+
+    // First domain failed — try next candidate (results are still empty, reset for next attempt)
+    logWarning(`[Instagram] ${domain} domain failed after ${pagesFetched} page(s) — ${candidates.indexOf(baseMediaUrl) < candidates.length - 1 ? 'trying fallback domain' : 'no more fallbacks'}`);
   }
 
-  logInfo(`[Instagram] Fetched ${results.length} posts with captions`);
+  // Both domains failed
+  if (lastError) throw lastError;
   return results;
 }
 
@@ -187,8 +331,11 @@ export async function refreshLongLivedToken(accessToken: string): Promise<{
 
 export async function validateToken(accessToken: string): Promise<boolean> {
   try {
+    // Business Login tokens require Authorization: Bearer instead of /me/
+    // Use /me with Bearer auth; if the token is invalid the API returns 401/400.
     await axios.get(`${IG_GRAPH_BASE}/me`, {
       params: { fields: 'id', access_token: accessToken },
+      headers: { Authorization: `Bearer ${accessToken}` },
       timeout: 8000
     });
     return true;

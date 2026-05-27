@@ -165,14 +165,11 @@ model Creator {
   aiSummaryHash         String?
   voiceId               String?
   voiceStatus           String?
-  voiceProvider         String           @default("chatterbox")
-  voiceIdChatterbox     String?
-  voiceIdElevenlabs     String?
+  voiceIdInworld        String?
   isFeatured            Boolean          @default(false)
   featuredOrder         Int?
   isMainHighlight       Boolean          @default(false)
   suggestedQuestions    String[]         @default([])
-  voiceIdInworld        String?
   personaConfig         Json?
   fewShotQA             Json?     // Array of { scenario: string, answer: string }
   voiceSamples          Json?     // Array of { id, name, url, duration, createdAt }

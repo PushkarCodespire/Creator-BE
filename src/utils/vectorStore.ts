@@ -147,6 +147,51 @@ export function deleteVectorsByContent(contentId: string) {
 }
 
 // ===========================================
+// EMBEDDING PROVIDER MIGRATION HELPERS
+// ===========================================
+
+/**
+ * Check the dimension of stored vectors against the expected dimension.
+ * Call this on startup after initializeVectorStore() to detect a provider switch.
+ * Returns { needsReembed: true } when dimensions don't match.
+ */
+export function checkEmbeddingDimension(expectedDimension: number): {
+  needsReembed: boolean;
+  storedDimension: number;
+  count: number;
+} {
+  if (!db) return { needsReembed: false, storedDimension: 0, count: 0 };
+
+  const countRow = db.prepare('SELECT COUNT(*) as count FROM vectors').get() as { count: number };
+  if (!countRow || countRow.count === 0) {
+    return { needsReembed: false, storedDimension: expectedDimension, count: 0 };
+  }
+
+  const row = db.prepare('SELECT embedding FROM vectors LIMIT 1').get() as { embedding: string } | undefined;
+  if (!row) return { needsReembed: false, storedDimension: expectedDimension, count: 0 };
+
+  const embedding = JSON.parse(row.embedding) as number[];
+  const storedDimension = embedding.length;
+
+  return {
+    needsReembed:    storedDimension !== expectedDimension,
+    storedDimension,
+    count:           countRow.count,
+  };
+}
+
+/**
+ * Delete ALL vectors so the backfill worker re-embeds them with the new provider.
+ * Only call this after checkEmbeddingDimension() confirms a mismatch.
+ */
+export function clearAllVectors(): number {
+  if (!db) return 0;
+  const result = db.prepare('DELETE FROM vectors').run();
+  logInfo(`[VectorStore] Cleared ${result.changes} vectors for provider migration`);
+  return result.changes;
+}
+
+// ===========================================
 // SIMILARITY SEARCH
 // ===========================================
 

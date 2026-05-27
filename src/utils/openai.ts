@@ -1,10 +1,20 @@
 // ===========================================
-// OPENAI UTILITY
-// GPT-4o mini for chat, text-embedding-3-small for embeddings
+// AI UTILITY (OpenAI + Gemini dual-provider)
+// Primary: Gemini 2.0 Flash (if GEMINI_API_KEY is set)
+// Fallback: GPT-4o mini (if OPENAI_API_KEY is set)
+// Embeddings: single consistent provider per session (no mid-stream switching)
 // ===========================================
 
 import OpenAI from 'openai';
 import { config } from '../config';
+import {
+  isGeminiConfigured,
+  generateGeminiChatCompletion,
+  generateGeminiEmbedding,
+  generateGeminiEmbeddings,
+  GEMINI_EMBEDDING_DIMENSION,
+} from './gemini';
+import { logWarning } from './logger';
 
 // Initialize OpenAI client (exported so other utils can reuse it)
 export const openai = new OpenAI({
@@ -16,40 +26,67 @@ export function isOpenAIConfigured(): boolean {
   return !!config.openai.apiKey;
 }
 
+// True if ANY AI provider is ready (Gemini OR OpenAI)
+export function isAIConfigured(): boolean {
+  return isGeminiConfigured() || isOpenAIConfigured();
+}
+
+// Which embedding provider is currently active? Must be consistent across a session.
+// Gemini (768-dim) takes priority when its key is present.
+export function getEmbeddingProvider(): 'gemini' | 'openai' {
+  return isGeminiConfigured() ? 'gemini' : 'openai';
+}
+
+export const OPENAI_EMBEDDING_DIMENSION = 1536;
+export { GEMINI_EMBEDDING_DIMENSION };
+
+// Expected dimension based on active provider
+export function getExpectedEmbeddingDimension(): number {
+  return isGeminiConfigured() ? GEMINI_EMBEDDING_DIMENSION : OPENAI_EMBEDDING_DIMENSION;
+}
+
 // ===========================================
 // EMBEDDINGS
 // ===========================================
 
 export async function generateEmbedding(text: string): Promise<number[]> {
+  // Gemini first (768-dim), OpenAI fallback (1536-dim)
+  // Never mix providers mid-session — dimensions must stay consistent.
+  if (isGeminiConfigured()) {
+    return generateGeminiEmbedding(text);
+  }
+
   if (!isOpenAIConfigured()) {
-    throw new Error('OpenAI API key not configured');
+    throw new Error('No embedding provider configured. Set GEMINI_API_KEY or OPENAI_API_KEY.');
   }
 
   const response = await openai.embeddings.create({
     model: 'text-embedding-3-small',
-    input: text.slice(0, 8000) // Limit input length
+    input: text.slice(0, 8000),
   });
 
   return response.data[0].embedding;
 }
 
 export async function generateEmbeddings(texts: string[]): Promise<number[][]> {
-  if (!isOpenAIConfigured()) {
-    throw new Error('OpenAI API key not configured');
+  // Gemini first (768-dim), OpenAI fallback (1536-dim)
+  if (isGeminiConfigured()) {
+    return generateGeminiEmbeddings(texts);
   }
 
-  // Process in batches of 100
+  if (!isOpenAIConfigured()) {
+    throw new Error('No embedding provider configured. Set GEMINI_API_KEY or OPENAI_API_KEY.');
+  }
+
   const batchSize = 100;
   const allEmbeddings: number[][] = [];
 
   for (let i = 0; i < texts.length; i += batchSize) {
     const batch = texts.slice(i, i + batchSize).map(t => t.slice(0, 8000));
-    
     const response = await openai.embeddings.create({
       model: 'text-embedding-3-small',
-      input: batch
+      input: batch,
     });
-
     allEmbeddings.push(...response.data.map(d => d.embedding));
   }
 
@@ -75,20 +112,34 @@ export async function generateChatCompletion(
   messages: ChatMessage[],
   options: ChatOptions = {}
 ): Promise<{ content: string; tokensUsed: number }> {
+  // Skip Gemini when the caller explicitly requests an OpenAI model ID
+  // (e.g. a fine-tuned model like "ft:gpt-4o-mini:...").
+  const forceOpenAI = !!options.model && !options.model.startsWith('gemini');
+
+  if (!forceOpenAI && isGeminiConfigured()) {
+    try {
+      return await generateGeminiChatCompletion(messages, options);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logWarning(`[AI] Gemini chat failed, falling back to OpenAI: ${msg}`);
+      if (!isOpenAIConfigured()) throw err; // no fallback available
+    }
+  }
+
   if (!isOpenAIConfigured()) {
-    throw new Error('OpenAI API key not configured');
+    throw new Error('No AI provider configured. Set GEMINI_API_KEY or OPENAI_API_KEY.');
   }
 
   const response = await openai.chat.completions.create({
     model: options.model || config.openai.model,
     messages,
     max_tokens: options.maxTokens || 1000,
-    temperature: options.temperature ?? 0.7
+    temperature: options.temperature ?? 0.7,
   });
 
   return {
     content: response.choices[0].message.content || '',
-    tokensUsed: response.usage?.total_tokens || 0
+    tokensUsed: response.usage?.total_tokens || 0,
   };
 }
 
@@ -180,9 +231,19 @@ export async function generateCreatorResponse(
   const contextMessage: ChatMessage | null = context.relevantChunks.length > 0
     ? {
         role: 'system',
-        content: `EXCERPTS FROM MY OWN CONTENT — I have actually said or written the following. Your answer MUST use specific facts, numbers, study names, or measurements from these excerpts. Do NOT give a generic answer that ignores this content. If an excerpt says a study name, a specific measurement, or a personal result — use it directly:\n\n${
-          context.relevantChunks.map((chunk, i) => `[${i + 1}] ${chunk.length > 700 ? chunk.slice(0, 700) + '…' : chunk}`).join('\n\n')
-        }\n\nNow answer in my voice — NOT like a generic assistant. Be specific. Use the facts above.`
+        content: `THESE ARE MY EXACT WORDS. Your ONLY job is to repeat them back in first person, preserving every specific detail.
+
+STRICT RULES — breaking any of these is wrong:
+- Keep ALL numbers exactly as written: "95kg" stays "95kg", NOT "ninety-five kilograms". "300–500" stays "300–500", NOT "three hundred to five hundred".
+- Keep ALL measurements, timeframes, and units exactly: "14 months" stays "14 months", "1.6–2.2g" stays "1.6–2.2g".
+- Do NOT paraphrase, summarise, or reword. If the excerpt says it, say it the same way.
+- Do NOT add information that is not in the excerpt below.
+- Do NOT add an intro like "Ah, you're asking about..." — start directly with the content.
+
+EXCERPT:
+${context.relevantChunks.map((chunk, i) => `[${i + 1}] ${chunk.length > 700 ? chunk.slice(0, 700) + '…' : chunk}`).join('\n\n')}
+
+Now deliver this as me, speaking directly to the person. Same words. Same numbers. Same structure.`
       }
     : null;
 
@@ -193,9 +254,14 @@ export async function generateCreatorResponse(
     { role: 'user', content: profilePrefix + userMessage }
   ];
 
+  // Very low temperature when RAG context is present — we want the model to
+  // copy the creator's exact words, numbers, and measurements faithfully.
+  // Without context (open-ended chat) keep it warmer so it sounds natural.
+  const temperature = context.relevantChunks.length > 0 ? 0.1 : 0.7;
+
   const response = await generateChatCompletion(messages, {
-    maxTokens: 800,
-    temperature: 0.7,
+    maxTokens: 2000,
+    temperature,
     model: context.modelOverride,
   });
 

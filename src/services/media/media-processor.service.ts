@@ -11,7 +11,8 @@ import mammoth from 'mammoth';
 import mime from 'mime-types';
 import { config } from '../../config';
 import { openai } from '../../utils/openai';
-import { logError, logInfo } from '../../utils/logger';
+import { isGeminiConfigured, describeImageWithGemini, transcribeAudioWithGemini } from '../../utils/gemini';
+import { logError, logInfo, logWarning } from '../../utils/logger';
 import { getUploadPathPrefixes } from '../../utils/uploadPaths';
 import type { MessageMedia } from '../../types/chat.types';
 
@@ -49,19 +50,43 @@ const readFileAsBase64DataUrl = (filePath: string): string => {
 };
 
 const transcribeAudio = async (filePath: string): Promise<string> => {
+  // Gemini first — free tier, handles most formats
+  if (isGeminiConfigured()) {
+    try {
+      const text = await transcribeAudioWithGemini(filePath);
+      if (text) return text;
+    } catch (geminiErr) {
+      logWarning(`[MediaProcessor] Gemini audio failed, falling back to Whisper: ${geminiErr instanceof Error ? geminiErr.message : String(geminiErr)}`);
+    }
+  }
+
+  // OpenAI Whisper fallback
+  if (!process.env.OPENAI_API_KEY) return '';
   try {
     const result = await openai.audio.transcriptions.create({
       file: fs.createReadStream(filePath),
-      model: 'whisper-1'
+      model: 'whisper-1',
     });
     return result.text?.trim() || '';
   } catch (error) {
-    logError(error instanceof Error ? error : new Error(String(error)), { context: 'MediaProcessor.transcribeAudio', filePath });
+    logError(error instanceof Error ? error : new Error(String(error)), { context: 'MediaProcessor.transcribeAudio (Whisper)', filePath });
     return '';
   }
 };
 
 const describeImage = async (filePath: string): Promise<string> => {
+  // Gemini first — multimodal, free tier
+  if (isGeminiConfigured()) {
+    try {
+      const description = await describeImageWithGemini(filePath);
+      if (description) return description;
+    } catch (geminiErr) {
+      logWarning(`[MediaProcessor] Gemini vision failed, falling back to OpenAI: ${geminiErr instanceof Error ? geminiErr.message : String(geminiErr)}`);
+    }
+  }
+
+  // OpenAI vision fallback
+  if (!process.env.OPENAI_API_KEY) return '';
   try {
     const dataUrl = readFileAsBase64DataUrl(filePath);
     const response = await openai.chat.completions.create({
@@ -70,24 +95,17 @@ const describeImage = async (filePath: string): Promise<string> => {
         {
           role: 'user',
           content: [
-            {
-              type: 'text',
-              text: 'Analyze this image. Briefly describe what you see and extract any visible text.'
-            },
-            {
-              type: 'image_url',
-              image_url: { url: dataUrl }
-            }
-          ]
-        }
+            { type: 'text', text: 'Analyze this image. Briefly describe what you see and extract any visible text.' },
+            { type: 'image_url', image_url: { url: dataUrl } },
+          ],
+        },
       ],
       max_tokens: 300,
-      temperature: 0.2
+      temperature: 0.2,
     });
-
     return response.choices[0]?.message?.content?.trim() || '';
   } catch (error) {
-    logError(error instanceof Error ? error : new Error(String(error)), { context: 'MediaProcessor.describeImage', filePath });
+    logError(error instanceof Error ? error : new Error(String(error)), { context: 'MediaProcessor.describeImage (OpenAI)', filePath });
     return '';
   }
 };

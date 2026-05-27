@@ -10,6 +10,7 @@ export interface ChunkingOptions {
   chunkSize?: number;
   chunkOverlap?: number;
   contentType?: 'transcript' | 'text'; // transcript uses sentence-aware chunking
+  minChunkLength?: number; // minimum chars to keep a chunk (default 10; was hard-coded 50)
 }
 
 export interface Chunk {
@@ -109,7 +110,8 @@ export function chunkContent(
   const {
     chunkSize = 800,
     chunkOverlap = 100,
-    contentType = 'text'
+    contentType = 'text',
+    minChunkLength = 10,
   } = options;
 
   // Transcript content gets the sentence-aware pipeline
@@ -213,8 +215,9 @@ export function chunkContent(
     .map((chunkText, index) => {
       const trimmed = chunkText.trim();
       
-      // Filter out invalid chunks
-      if (!trimmed || trimmed.length < 50) {
+      // Filter out invalid chunks (minChunkLength defaults to 10;
+      // short-form content like Instagram captions passes a lower value)
+      if (!trimmed || trimmed.length < minChunkLength) {
         return null;
       }
 

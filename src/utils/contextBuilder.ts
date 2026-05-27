@@ -3,10 +3,29 @@
 // Enhanced context building for AI responses
 // ===========================================
 
-import { searchSimilar } from './vectorStore';
+import { searchSimilar, hybridSearch, SearchResult } from './vectorStore';
 import { generateEmbedding, generateChatCompletion } from './openai';
-import prisma from '../../prisma/client';
 import { logInfo } from './logger';
+
+// ── Embedding cache ────────────────────────────────────────────────────────────
+// Avoids re-embedding the same text multiple times within a session.
+// FIFO eviction at 200 entries keeps memory bounded to ~2.5 MB
+// (Gemini: 200 × 3072 dims × 4 bytes ≈ 2.4 MB).
+const _embCache = new Map<string, number[]>();
+const EMB_CACHE_MAX = 200;
+
+async function getCachedEmbedding(text: string): Promise<number[]> {
+  const hit = _embCache.get(text);
+  if (hit) return hit;
+  const vec = await generateEmbedding(text);
+  if (_embCache.size >= EMB_CACHE_MAX) {
+    // Evict the oldest entry (Map preserves insertion order)
+    const firstKey = _embCache.keys().next().value;
+    if (firstKey !== undefined) _embCache.delete(firstKey);
+  }
+  _embCache.set(text, vec);
+  return vec;
+}
 
 export interface ContextChunk {
   text: string;
@@ -51,15 +70,15 @@ export async function buildEnhancedContext(options: ContextOptions): Promise<{
     includeConversationSummary = false,
   } = options;
 
-  // HyDE is only worth the extra OpenAI call (~500ms) for research/data queries.
+  // HyDE is only worth the extra AI call (~500ms) for explicit study/evidence queries.
   // General coaching questions get fast plain-embedding search instead.
   const needsHyde = isResearchQuery(userMessage);
 
   // PERF: Start plain embedding and (if needed) HyDE generation simultaneously.
-  // Previously: embed → hyde → embed(hyde text) — 3 sequential OpenAI calls.
-  // Now: embed & hyde run in parallel, then one more embed only when hyde succeeded.
+  // Previously: embed → hyde → embed(hyde text) — 3 sequential AI calls.
+  // Now: embed & hyde run in parallel; cache avoids re-embedding repeated queries.
   const [queryEmbedding, hydeResponse] = await Promise.all([
-    generateEmbedding(userMessage),
+    getCachedEmbedding(userMessage),
     needsHyde
       ? generateChatCompletion([
           { role: 'system', content: 'Answer in 2 sentences as a fitness researcher. Include specific: study author names, outcomes in lbs/kg, measurement methods (DEXA, MRI, EMG). Output only the answer.' },
@@ -72,12 +91,12 @@ export async function buildEnhancedContext(options: ContextOptions): Promise<{
   if (hydeResponse) {
     const hydeText = hydeResponse.content.trim();
     logInfo(`[RAG] HyDE: "${hydeText.slice(0, 100)}"`);
-    try { contentEmbedding = await generateEmbedding(hydeText); } catch { /* fall back to plain */ }
+    try { contentEmbedding = await getCachedEmbedding(hydeText); } catch { /* fall back to plain */ }
   } else {
     logInfo(`[RAG] HyDE skipped (${needsHyde ? 'failed' : 'not a research query'}): "${userMessage.slice(0, 60)}"`);
   }
 
-  // Search corrections (plain embedding — exact question matching)
+  // Corrections search (plain embedding — exact question matching, sync SQLite)
   const rawCorrections = searchSimilar(creatorId, queryEmbedding, 2, 0.82, { type: 'correction' });
   const correctionExamples = rawCorrections
     .map(r => ({
@@ -86,21 +105,26 @@ export async function buildEnhancedContext(options: ContextOptions): Promise<{
     }))
     .filter(c => c.question && c.answer);
 
-  // PERF: Fetch Postgres chunks and keyword search in parallel.
-  // Chunk fetch is reused for both hyde+plain similarity passes (one DB round trip).
-  const [allRows, keywordResults] = await Promise.all([
-    prisma.contentChunk.findMany({
-      where: { content: { creatorId, status: 'COMPLETED' }, embedding: { not: null } },
-      select: { text: true, embedding: true, content: { select: { title: true, type: true } } },
-      take: 500,
-    }),
-    useHybridSearch ? performKeywordSearch(creatorId, userMessage, maxChunks) : Promise.resolve([]),
-  ]);
+  // PERF: SQLite vector store is in-process — no async DB round-trips needed.
+  // hybridSearch runs semantic + keyword scoring in one synchronous pass.
+  // This replaces the previous prisma.contentChunk.findMany({ take: 500 }) call.
+  const toChunk = (r: SearchResult): ContextChunk => ({
+    text:     r.text,
+    score:    r.score,
+    source:   r.metadata?.contentTitle as string | undefined,
+    metadata: { contentType: r.metadata?.contentType as string | undefined },
+  });
 
-  const hydeResults  = scoreChunks(allRows, contentEmbedding, maxChunks * 2, minScore);
-  const plainResults = needsHyde && contentEmbedding !== queryEmbedding
-    ? scoreChunks(allRows, queryEmbedding, maxChunks * 2, minScore)
+  const hydeRaw = useHybridSearch
+    ? hybridSearch(creatorId, contentEmbedding, userMessage, maxChunks * 2, minScore)
+    : searchSimilar(creatorId, contentEmbedding, maxChunks * 2, minScore);
+
+  const plainRaw = (needsHyde && contentEmbedding !== queryEmbedding)
+    ? searchSimilar(creatorId, queryEmbedding, maxChunks * 2, minScore)
     : [];
+
+  const hydeResults  = hydeRaw.map(toChunk);
+  const plainResults = plainRaw.map(toChunk);
 
   // Merge: de-duplicate by first-100-chars key, keep the higher score
   const mergeMap = new Map<string, ContextChunk>();
@@ -113,10 +137,10 @@ export async function buildEnhancedContext(options: ContextOptions): Promise<{
     .sort((a, b) => b.score - a.score)
     .slice(0, maxChunks * 2);
 
-  logInfo(`[RAG] semantic=${semanticResults.length} hyde=${hydeResults.length} plain=${plainResults.length} keyword=${keywordResults.length} minScore=${minScore} for: "${userMessage.slice(0, 60)}"`);
+  logInfo(`[RAG] semantic=${semanticResults.length} hyde=${hydeResults.length} plain=${plainResults.length} (SQLite) minScore=${minScore} for: "${userMessage.slice(0, 60)}"`);
 
-  // Combine and re-rank results
-  const combinedResults = combineAndRerank(semanticResults, keywordResults, maxChunks);
+  // Re-rank — keyword boost already applied by hybridSearch above
+  const combinedResults = combineAndRerank(semanticResults, [], maxChunks);
   logInfo(`[RAG] combined=${combinedResults.length} chunks passed to AI`);
 
   // Build conversation summary if needed
@@ -136,142 +160,37 @@ export async function buildEnhancedContext(options: ContextOptions): Promise<{
   };
 }
 
-/**
- * Perform keyword-based search
- */
-async function performKeywordSearch(
-  creatorId: string,
-  query: string,
-  maxResults: number
-): Promise<ContextChunk[]> {
-  // Extract keywords from query
-  const keywords = extractKeywords(query);
-
-  if (keywords.length === 0) {
-    return [];
-  }
-
-  // Search in content chunks — OR across top 3 keywords so domain-specific
-  // words like "incline" or "bench" win over generic long words like "instead"
-  const searchKeywords = keywords.slice(0, 3);
-  const chunks = await prisma.contentChunk.findMany({
-    where: {
-      content: { creatorId },
-      OR: searchKeywords.map(k => ({
-        text: { contains: k, mode: 'insensitive' as const },
-      })),
-    },
-    take: maxResults * 2,
-    include: {
-      content: {
-        select: {
-          title: true,
-          type: true,
-        },
-      },
-    },
-  });
-
-  // Score chunks based on keyword matches
-  return chunks.map((chunk) => {
-    const text = chunk.text.toLowerCase();
-    const score = keywords.reduce((acc, keyword) => {
-      const matches = (text.match(new RegExp(keyword.toLowerCase(), 'g')) || []).length;
-      return acc + matches * 0.1;
-    }, 0.5); // Base score
-
-    return {
-      text: chunk.text,
-      score: Math.min(score, 1.0),
-      source: chunk.content.title,
-      metadata: {
-        contentType: chunk.content.type,
-      },
-    };
-  });
-}
-
-// HyDE is only worthwhile when the query is asking for specific facts/data.
-// Routing general coaching questions through HyDE adds ~500ms for zero benefit.
+// HyDE is only worthwhile when the query explicitly asks about studies or clinical evidence.
+// Removing broad triggers like /\d+/ and /\bhow much\b/ that fired on routine coaching
+// questions (e.g. "how much protein?") and added ~500ms with no quality improvement.
 function isResearchQuery(message: string): boolean {
   const lower = message.toLowerCase();
   return [
-    /\bstudy\b/, /\bresearch\b/, /\bevidence\b/, /\bscientific\b/, /\bproven\b/,
-    /\bshown\b/, /\bfound\b/, /\bmeta.?analysis\b/, /\bclinical\b/,
-    /\bhow much\b/, /\bhow many\b/, /\bpercent/, /\blbs?\b/, /\bkgs?\b/, /\bgrams?\b/,
+    /\bstudy\b/, /\bstudies\b/, /\bresearch\b/, /\bevidence\b/, /\bscientific\b/, /\bproven\b/,
+    /\bmeta.?analysis\b/, /\bclinical(?:ly)?\b/, /\bpeer.?reviewed\b/,
     /\bdexa\b/, /\bemg\b/, /\bmri\b/, /\bultrasound\b/,
-    /\d+/,
   ].some(p => p.test(lower));
 }
 
-function cosineSimilarity(a: number[], b: number[]): number {
-  if (a.length !== b.length) return 0;
-  let dot = 0, normA = 0, normB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot   += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  return normA === 0 || normB === 0 ? 0 : dot / (Math.sqrt(normA) * Math.sqrt(normB));
-}
-
-// Score pre-fetched rows against a query embedding — avoids a second DB round trip.
-type ChunkRow = { text: string; embedding: unknown; content: { title: string; type: string } };
-function scoreChunks(rows: ChunkRow[], queryEmbedding: number[], topK: number, minScore: number): ContextChunk[] {
-  const scored: ContextChunk[] = [];
-  for (const row of rows) {
-    try {
-      const vec = JSON.parse(row.embedding as string) as number[];
-      const score = cosineSimilarity(queryEmbedding, vec);
-      if (score >= minScore) {
-        scored.push({ text: row.text, score, source: row.content.title, metadata: { contentType: row.content.type } });
-      }
-    } catch { /* skip malformed */ }
-  }
-  return scored.sort((a, b) => b.score - a.score).slice(0, topK);
-}
-
 /**
- * Extract keywords from query
- */
-function extractKeywords(query: string): string[] {
-  // Remove common stop words
-  const stopWords = new Set([
-    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by',
-    'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did',
-    'will', 'would', 'should', 'could', 'may', 'might', 'must', 'can', 'this', 'that', 'these', 'those',
-    'i', 'you', 'he', 'she', 'it', 'we', 'they', 'what', 'which', 'who', 'whom', 'whose', 'where', 'when', 'why', 'how',
-  ]);
-
-  // Extract words (3+ characters, not stop words)
-  const words = query
-    .toLowerCase()
-    .replace(/[^\w\s]/g, ' ')
-    .split(/\s+/)
-    .filter((word) => word.length >= 3 && !stopWords.has(word));
-
-  // Return unique words, sorted by length (longer words are more specific)
-  return [...new Set(words)].sort((a, b) => b.length - a.length).slice(0, 5);
-}
-
-/**
- * Combine semantic and keyword results, then re-rank
+ * Combine and re-rank results.
+ * Semantic results get a 0.7 weight; keyword results boost already-matched chunks only.
  */
 function combineAndRerank(
-  semanticResults: Array<{ text: string; score: number }>,
+  semanticResults: ContextChunk[],
   keywordResults: ContextChunk[],
   maxResults: number
 ): ContextChunk[] {
-  // Create a map to combine results
   const combinedMap = new Map<string, ContextChunk>();
 
-  // Add semantic results
-  semanticResults.forEach((result, _index) => {
-    const key = result.text.substring(0, 100); // Use first 100 chars as key
+  semanticResults.forEach((result) => {
+    const key = result.text.substring(0, 100);
     if (!combinedMap.has(key)) {
       combinedMap.set(key, {
-        text: result.text,
-        score: result.score * 0.7, // Weight semantic search
+        text:     result.text,
+        score:    result.score * 0.7,
+        source:   result.source,
+        metadata: result.metadata,
       });
     }
   });
@@ -284,12 +203,11 @@ function combineAndRerank(
     if (combinedMap.has(key)) {
       const existing = combinedMap.get(key)!;
       existing.score = Math.min(existing.score + result.score * 0.3, 1.0);
-      if (result.source) existing.source = result.source;
+      if (result.source)   existing.source   = result.source;
       if (result.metadata) existing.metadata = result.metadata;
     }
   });
 
-  // Convert to array, sort by score, and return top results
   return Array.from(combinedMap.values())
     .sort((a, b) => b.score - a.score)
     .slice(0, maxResults);
@@ -301,15 +219,11 @@ function combineAndRerank(
 async function generateConversationSummary(
   conversationHistory: ConversationMessage[]
 ): Promise<string> {
-  // Simple summary: extract key topics and main points
-  // In production, this could use OpenAI to generate a proper summary
-
   const userMessages = conversationHistory
     .filter((m) => m.role === 'user')
     .map((m) => m.content)
     .join(' ');
 
-  // Extract key phrases (simple approach)
   const words = userMessages
     .toLowerCase()
     .replace(/[^\w\s]/g, ' ')
@@ -339,6 +253,3 @@ export function calculateTemporalWeight(createdAt: Date, daysOld: number): numbe
   // Recent content (0-30 days) gets weight 1.0, older content gets less
   return ageRatio < 0.08 ? 1.0 : Math.max(0.5, 1.0 - ageRatio * 0.5);
 }
-
-
-

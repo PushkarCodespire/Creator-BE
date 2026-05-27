@@ -1,7 +1,7 @@
 // ===========================================
 // VOICE TEXT PREPROCESSOR
 // Prepares AI response text for natural TTS output.
-// Applied before sending to any voice provider (Inworld, ElevenLabs, Chatterbox).
+// Applied before sending to Inworld TTS.
 // ===========================================
 
 // Units and technical abbreviations that TTS engines mispronounce

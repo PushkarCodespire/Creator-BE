@@ -26,6 +26,7 @@
   "dependencies": {
     "@danielxceron/youtube-transcript": "^1.2.6",
     "@distube/ytdl-core": "^4.16.12",
+    "@google/generative-ai": "^0.24.1",
     "@prisma/adapter-pg": "^5.22.0",
     "@prisma/client": "^5.22.0",
     "@types/bad-words": "^3.0.3",

@@ -36,6 +36,7 @@ import { config } from '../config';
 import {
   generateCreatorResponse,
   isOpenAIConfigured,
+  isAIConfigured,
   stripMarkdown
 } from '../utils/openai';
 import { buildEnhancedContext } from '../utils/contextBuilder';
@@ -191,10 +192,7 @@ export const sendMessage = asyncHandler(async (req: Request, res: Response) => {
           fewShotQA: true,
           fineTunedModelId: true,
           voiceId: true,
-          voiceIdChatterbox: true,
           voiceIdInworld: true,
-          voiceIdElevenlabs: true,
-          voiceProvider: true,
         }
       },
       messages: {
@@ -392,7 +390,7 @@ export const sendMessage = asyncHandler(async (req: Request, res: Response) => {
   // Generate AI response
   let aiResponse = { content: '', tokensUsed: 0 };
 
-  if (isOpenAIConfigured()) {
+  if (isAIConfigured()) {
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const { combined: attachmentContext } = await buildAttachmentContext(media as any);
@@ -543,12 +541,7 @@ export const sendMessage = asyncHandler(async (req: Request, res: Response) => {
       }
 
       if (req.body?.voiceMode && !voiceBlocked) try {
-        const creatorAny = conversation.creator as unknown as {
-          voiceProvider?: string;
-          voiceIdChatterbox?: string | null;
-          voiceIdInworld?: string | null;
-          voiceIdElevenlabs?: string | null;
-        };
+        const creatorAny = conversation.creator as unknown as { voiceIdInworld?: string | null };
 
         let prosodyRow: { voiceSpeakingRate: number | null; voicePitch: number | null } | undefined;
         try {
@@ -558,44 +551,21 @@ export const sendMessage = asyncHandler(async (req: Request, res: Response) => {
           prosodyRow = row;
         } catch { /* non-fatal — TTS proceeds with default prosody values */ }
 
-        const requested: string =
-          req.body?.voiceProvider === 'elevenlabs' ||
-          req.body?.voiceProvider === 'inworld' ||
-          req.body?.voiceProvider === 'chatterbox'
-            ? req.body.voiceProvider
-            : (creatorAny.voiceProvider || 'inworld');
-
-        const chatterboxSvc = require('../services/voice/chatterbox.service');
         const inworldSvc = require('../services/voice/inworld.service');
-        const elevenlabsSvc = require('../services/voice/elevenlabs.service');
+        const ttsText    = preprocessForTTS(aiResponse.content);
 
-        const ttsText = preprocessForTTS(aiResponse.content);
-
-        const tryProvider = async (provider: string): Promise<string | null> => {
-          let svc, vid;
-          if (provider === 'elevenlabs') { svc = elevenlabsSvc; vid = creatorAny.voiceIdElevenlabs; }
-          else if (provider === 'chatterbox') { svc = chatterboxSvc; vid = creatorAny.voiceIdChatterbox; }
-          else { svc = inworldSvc; vid = creatorAny.voiceIdInworld; }
-          if (!svc.isConfigured() || !vid) return null;
-          const prosody = provider === 'inworld'
-            ? { speakingRate: prosodyRow?.voiceSpeakingRate ?? undefined, pitch: prosodyRow?.voicePitch ?? undefined }
-            : undefined;
-          return svc.textToSpeech(vid, ttsText, prosody);
-        };
-
-        const fallback = requested === 'elevenlabs' ? 'inworld' :
-                         requested === 'chatterbox' ? 'inworld' : 'chatterbox';
-        const order = [requested, fallback];
-        for (const provider of order) {
-          try {
-            const audioPath = await tryProvider(provider);
-            if (audioPath) {
-              audioUrl = audioPath.startsWith('http') ? audioPath : `/uploads/${audioPath}`;
-              voiceProviderUsed = provider;
-              break;
+        if (inworldSvc.isConfigured() && creatorAny.voiceIdInworld) {
+          const audioPath = await inworldSvc.textToSpeech(
+            creatorAny.voiceIdInworld,
+            ttsText,
+            {
+              speakingRate: prosodyRow?.voiceSpeakingRate ?? undefined,
+              pitch:        prosodyRow?.voicePitch        ?? undefined,
             }
-          } catch (err: unknown) {
-            logWarning(`Voice TTS failed on ${provider}, trying fallback: ` + (err instanceof Error ? err.message : String(err)));
+          );
+          if (audioPath) {
+            audioUrl = audioPath.startsWith('http') ? audioPath : `/uploads/${audioPath}`;
+            voiceProviderUsed = 'inworld';
           }
         }
       } catch (voiceErr: unknown) {
@@ -776,7 +746,7 @@ export const sendMessage = asyncHandler(async (req: Request, res: Response) => {
       data: {
         conversationId,
         role: 'ASSISTANT',
-        content: `Thank you for your message! I'm ${conversation.creator.displayName}. AI responses are currently disabled (OpenAI not configured). Please configure your OpenAI API key to enable AI chat.`
+        content: `Thank you for your message! I'm ${conversation.creator.displayName}. AI responses are currently disabled — no AI provider is configured. Please set GEMINI_API_KEY (or OPENAI_API_KEY) in the server environment.`
       }
     });
 

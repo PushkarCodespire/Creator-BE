@@ -329,6 +329,37 @@ app.use('/api/permissions', permissionsRoutes);
 app.use('/api/media', mediaRoutes);
 // app.use('/api/download', downloadRoutes); // Moved directly to /api/uploads
 
+// ── Legal pages (required for Meta app Live mode) ─────────────────────────────
+app.get('/privacy', (_req, res) => {
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Privacy Policy — Creator Platform</title>
+  <style>body{font-family:sans-serif;max-width:700px;margin:60px auto;padding:0 20px;color:#222;line-height:1.7}h1{font-size:2rem}h2{margin-top:2rem}</style></head>
+  <body>
+    <h1>Privacy Policy</h1>
+    <p>Last updated: May 2026</p>
+    <h2>What data we collect</h2>
+    <p>When you connect your Instagram account, we collect your Instagram user ID, username, and the captions of your posts. This data is used solely to power your AI assistant on the Creator Platform.</p>
+    <h2>How we use your data</h2>
+    <p>Your Instagram post content is processed to generate AI responses on your behalf. We do not sell, share, or use your data for advertising.</p>
+    <h2>Data retention</h2>
+    <p>Your data is stored as long as your account is active. You can disconnect Instagram and delete all associated data at any time from your dashboard.</p>
+    <h2>Contact</h2>
+    <p>For any privacy concerns, email us at support@creatorplatform.com</p>
+  </body></html>`);
+});
+
+app.get('/data-deletion', (_req, res) => {
+  res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Data Deletion — Creator Platform</title>
+  <style>body{font-family:sans-serif;max-width:700px;margin:60px auto;padding:0 20px;color:#222;line-height:1.7}h1{font-size:2rem}h2{margin-top:2rem}</style></head>
+  <body>
+    <h1>Data Deletion Instructions</h1>
+    <p>To delete all your data from Creator Platform:</p>
+    <h2>Option 1 — From your dashboard</h2>
+    <p>Log in → Your AI → Instagram Posts → Disconnect Instagram. This removes your access token and all imported posts immediately.</p>
+    <h2>Option 2 — Email request</h2>
+    <p>Email <strong>support@creatorplatform.com</strong> with the subject "Data Deletion Request" and we will delete all your data within 30 days.</p>
+  </body></html>`);
+});
+
 
 
 // ===========================================
@@ -367,6 +398,27 @@ async function startServer() {
     // Initialize vector store
     await initializeVectorStore();
     logInfo('✅ Vector store initialized');
+
+    // ── Embedding provider migration check ─────────────────────────────────
+    // If GEMINI_API_KEY is set, embeddings are 768-dim (text-embedding-004).
+    // If only OPENAI_API_KEY, embeddings are 1536-dim (text-embedding-3-small).
+    // Switching provider requires wiping stored vectors so dimensions stay consistent.
+    {
+      const { checkEmbeddingDimension, clearAllVectors } = await import('./utils/vectorStore');
+      const { getExpectedEmbeddingDimension } = await import('./utils/openai');
+      const expectedDim = getExpectedEmbeddingDimension();
+      const { needsReembed, storedDimension, count } = checkEmbeddingDimension(expectedDim);
+      if (needsReembed && count > 0) {
+        logWarning(
+          `[VectorStore] Embedding provider changed: stored vectors are ${storedDimension}-dim, ` +
+          `current provider uses ${expectedDim}-dim. Clearing ${count} vectors — ` +
+          `they will be rebuilt by the content backfill below.`
+        );
+        clearAllVectors();
+      } else if (count > 0) {
+        logInfo(`[VectorStore] Embedding dimension OK (${storedDimension}-dim, ${count} vectors)`);
+      }
+    }
 
     // Backfill any corrections saved before RAG indexing was deployed
     const { backfillCorrectionVectors } = await import('./controllers/creator/training.controller');
