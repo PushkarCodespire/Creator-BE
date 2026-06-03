@@ -154,7 +154,7 @@ export const startConversation = asyncHandler(async (req: Request, res: Response
 // ===========================================
 
 export const sendMessage = asyncHandler(async (req: Request, res: Response) => {
-  const { conversationId, content, media, voiceMode } = req.body;
+  const { conversationId, content, media, voiceMode, language } = req.body;
   const userId = req.user?.id;
   const guestId = req.headers['x-guest-id'] as string;
   const ip =
@@ -439,7 +439,7 @@ export const sendMessage = asyncHandler(async (req: Request, res: Response) => {
 
       // Generate response — voice mode keeps it short and plain text
       const effectivePrompt = voiceMode
-        ? `${userPrompt}\n\n[IMPORTANT: Keep your answer to 1-2 short sentences. No markdown, no bullet points, no formatting. Speak naturally as if in a voice conversation.]`
+        ? `${userPrompt}\n\n[IMPORTANT: Keep your answer to 1-2 short sentences. No markdown, no bullet points, no formatting. Speak naturally as if in a voice conversation.${language === 'hi' ? ' Respond entirely in Hindi (Devanagari script).' : ''}]`
         : userPrompt;
       const startTime = Date.now();
       aiResponse = await generateCreatorResponse(
