@@ -50,10 +50,14 @@ export function getExpectedEmbeddingDimension(): number {
 // ===========================================
 
 export async function generateEmbedding(text: string): Promise<number[]> {
-  // Gemini first (768-dim), OpenAI fallback (1536-dim)
-  // Never mix providers mid-session — dimensions must stay consistent.
   if (isGeminiConfigured()) {
-    return generateGeminiEmbedding(text);
+    try {
+      return await generateGeminiEmbedding(text);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logWarning(`[AI] Gemini embedding failed, falling back to OpenAI: ${msg}`);
+      if (!isOpenAIConfigured()) throw err;
+    }
   }
 
   if (!isOpenAIConfigured()) {
@@ -69,9 +73,14 @@ export async function generateEmbedding(text: string): Promise<number[]> {
 }
 
 export async function generateEmbeddings(texts: string[]): Promise<number[][]> {
-  // Gemini first (768-dim), OpenAI fallback (1536-dim)
   if (isGeminiConfigured()) {
-    return generateGeminiEmbeddings(texts);
+    try {
+      return await generateGeminiEmbeddings(texts);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logWarning(`[AI] Gemini batch embedding failed, falling back to OpenAI: ${msg}`);
+      if (!isOpenAIConfigured()) throw err;
+    }
   }
 
   if (!isOpenAIConfigured()) {
