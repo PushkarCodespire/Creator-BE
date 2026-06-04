@@ -287,6 +287,106 @@ Now deliver this as me, speaking directly to the person. Same words. Same number
   };
 }
 
+// ===========================================
+// STREAMING VOICE — sentence-level TTS pipeline
+// ===========================================
+
+/**
+ * Convert text to speech via OpenAI TTS-1 (~400ms latency).
+ * Returns a raw MP3 Buffer — no file I/O, no Cloudinary.
+ * Caller emits it as base64 over the socket immediately.
+ */
+export async function textToSpeechBuffer(
+  text: string,
+  voice: 'alloy' | 'echo' | 'fable' | 'onyx' | 'nova' | 'shimmer' = 'alloy'
+): Promise<Buffer> {
+  if (!isOpenAIConfigured()) throw new Error('OpenAI not configured for TTS');
+  const response = await openai.audio.speech.create({
+    model: 'tts-1',
+    voice,
+    input: text.slice(0, 4096),
+    response_format: 'mp3',
+  });
+  return Buffer.from(await response.arrayBuffer());
+}
+
+/**
+ * Stream an AI voice response sentence-by-sentence.
+ * Yields each complete sentence as soon as it arrives from the model so
+ * TTS can start on sentence 1 while sentence 2 is still being generated.
+ * Uses a compact system prompt (fewer tokens = faster first token).
+ */
+export async function* streamCreatorResponseSentences(
+  userMessage: string,
+  context: CreatorContext,
+  conversationHistory: ChatMessage[] = [],
+): AsyncGenerator<{ sentence: string; accumulated: string }> {
+  if (!isOpenAIConfigured()) throw new Error('OpenAI required for streaming voice');
+
+  const systemPrompt = buildCreatorSystemPrompt(context);
+
+  const p = context.personaConfig || {};
+  const personaLock = (p.energyLevel || p.honestyStyle || p.humor)
+    ? `\nVOICE LOCK: You are ${context.creatorName}. Sound exactly like the persona above — not like a generic assistant.`
+    : '';
+
+  const contextMessage: ChatMessage | null = context.relevantChunks.length > 0
+    ? {
+        role: 'system',
+        content: `MY EXACT WORDS — speak these back in first person:\n${
+          context.relevantChunks.slice(0, 3).map((c, i) => `[${i + 1}] ${c.slice(0, 400)}`).join('\n\n')
+        }`
+      }
+    : null;
+
+  const messages: ChatMessage[] = [
+    {
+      role: 'system',
+      content: `${systemPrompt}${personaLock}\n\nVOICE MODE: Reply in 1-2 short spoken sentences. Plain text only — no markdown, bullets, or formatting.`,
+    },
+    ...conversationHistory.slice(-6),
+    ...(contextMessage ? [contextMessage] : []),
+    { role: 'user', content: (context.userProfile ? `[About me: ${context.userProfile}]\n` : '') + userMessage },
+  ];
+
+  const stream = await openai.chat.completions.create({
+    model: (context.modelOverride && !context.modelOverride.startsWith('gemini'))
+      ? context.modelOverride
+      : config.openai.model,
+    messages,
+    max_tokens: 120,
+    temperature: context.relevantChunks.length > 0 ? 0.15 : 0.7,
+    stream: true,
+  });
+
+  let buffer = '';
+  let accumulated = '';
+  const sentenceEnd = /[.!?।]+(?:\s|$)/;
+
+  for await (const chunk of stream) {
+    const delta = chunk.choices[0]?.delta?.content || '';
+    if (!delta) continue;
+    buffer += delta;
+
+    const match = sentenceEnd.exec(buffer);
+    if (match) {
+      const sentence = buffer.slice(0, match.index + match[0].trimEnd().length).trim();
+      buffer = buffer.slice(match.index + match[0].length);
+      if (sentence.length > 3) {
+        accumulated += (accumulated ? ' ' : '') + sentence;
+        yield { sentence, accumulated };
+      }
+    }
+  }
+
+  // Flush any remaining text
+  const tail = buffer.trim();
+  if (tail.length > 3) {
+    accumulated += (accumulated ? ' ' : '') + tail;
+    yield { sentence: tail, accumulated };
+  }
+}
+
 export function stripMarkdown(text: string): string {
   return text
     // Bold: **text** or __text__ → text

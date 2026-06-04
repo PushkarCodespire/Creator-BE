@@ -35,6 +35,8 @@ import { asyncHandler, AppError } from '../middleware/errorHandler';
 import { config } from '../config';
 import {
   generateCreatorResponse,
+  streamCreatorResponseSentences,
+  textToSpeechBuffer,
   isOpenAIConfigured,
   isAIConfigured,
   stripMarkdown
@@ -437,30 +439,107 @@ export const sendMessage = asyncHandler(async (req: Request, res: Response) => {
 
       logInfo(`[Chat] personaConfig=${JSON.stringify(conversation.creator.personaConfig)}`);
 
-      // Generate response — voice mode keeps it short and plain text
-      const effectivePrompt = voiceMode
-        ? `${userPrompt}\n\n[IMPORTANT: Keep your answer to 1-2 short sentences. No markdown, no bullet points, no formatting. Speak naturally as if in a voice conversation.${language === 'hi' ? ' Respond entirely in Hindi (Devanagari script).' : ''}]`
-        : userPrompt;
+      const creatorCtx = {
+        creatorName: conversation.creator.displayName,
+        personality: conversation.creator.aiPersonality || undefined,
+        tone: conversation.creator.aiTone || undefined,
+        responseStyle: conversation.creator.responseStyle || undefined,
+        welcomeMessage: conversation.creator.welcomeMessage || undefined,
+        personaConfig: (conversation.creator.personaConfig as import('../utils/openai').PersonaConfig | null) || null,
+        fewShotQA: (conversation.creator.fewShotQA as unknown as import('../utils/openai').FewShotQA[] | null) || null,
+        relevantChunks: context.relevantChunks.map(c => c.text),
+        correctionExamples: context.correctionExamples,
+        conversationSummary: context.conversationSummary,
+        userProfile,
+        modelOverride: (conversation.creator as { fineTunedModelId?: string | null }).fineTunedModelId || undefined,
+      };
+
+      // ── Voice subscription gate (must run before AI generation) ────────────────
+      let audioUrl: string | null = null;
+      let voiceProviderUsed: string | null = null;
+      let voiceBlocked = false;
+      let voiceTrialsRemaining = 0;
+      let shouldIncrementVoiceTrial = false;
+
+      if (voiceMode && userId) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const voiceSub = await (prisma.subscription as any).findUnique({
+          where: { userId },
+          select: { plan: true, voiceTrialUsed: true }
+        }) as { plan: string; voiceTrialUsed: number } | null;
+        if (voiceSub?.plan !== 'PREMIUM') {
+          const used = voiceSub?.voiceTrialUsed ?? 0;
+          const limit = config.subscription.freeVoiceTrials;
+          if (used >= limit) {
+            voiceBlocked = true;
+          } else {
+            shouldIncrementVoiceTrial = true;
+            voiceTrialsRemaining = limit - used - 1;
+          }
+        }
+      }
+
       const startTime = Date.now();
-      aiResponse = await generateCreatorResponse(
-        effectivePrompt,
-        {
-          creatorName: conversation.creator.displayName,
-          personality: conversation.creator.aiPersonality || undefined,
-          tone: conversation.creator.aiTone || undefined,
-          responseStyle: conversation.creator.responseStyle || undefined,
-          welcomeMessage: conversation.creator.welcomeMessage || undefined,
-          personaConfig: (conversation.creator.personaConfig as import('../utils/openai').PersonaConfig | null) || null,
-          fewShotQA: (conversation.creator.fewShotQA as unknown as import('../utils/openai').FewShotQA[] | null) || null,
-          relevantChunks: context.relevantChunks.map(c => c.text),
-          correctionExamples: context.correctionExamples,
-          conversationSummary: context.conversationSummary,
-          userProfile,
-          modelOverride: (conversation.creator as { fineTunedModelId?: string | null }).fineTunedModelId || undefined,
-        },
-        context.enhancedHistory,
-        context.conversationSummary
-      );
+
+      // ── STREAMING VOICE PATH ─────────────────────────────────────────────────
+      // For voice mode: stream sentences from the LLM, run TTS on each sentence
+      // as it arrives, and emit audio chunks via socket. The user hears the first
+      // word within ~700–900ms instead of waiting 3–4s for the full pipeline.
+      let voiceStreamed = false;
+
+      if (voiceMode && !voiceBlocked && isOpenAIConfigured()) {
+        let chunkIndex = 0;
+        let fullText = '';
+
+        try {
+          const langHint = language === 'hi'
+            ? ' Respond entirely in Hindi (Devanagari script).'
+            : '';
+
+          for await (const { sentence, accumulated } of streamCreatorResponseSentences(
+            `${userPrompt}${langHint}`,
+            creatorCtx,
+            context.enhancedHistory,
+          )) {
+            fullText = accumulated;
+
+            // TTS each sentence the moment it arrives — fire immediately
+            try {
+              const audioBuffer = await textToSpeechBuffer(preprocessForTTS(sentence));
+              emitToConversation(conversationId, 'voice:chunk', {
+                conversationId,
+                chunkIndex,
+                audioBase64: audioBuffer.toString('base64'),
+                text: sentence,
+                fullTextSoFar: fullText,
+              });
+              chunkIndex++;
+            } catch (ttsErr) {
+              logWarning(`[Voice] TTS chunk ${chunkIndex} failed (non-fatal): ${ttsErr instanceof Error ? ttsErr.message : String(ttsErr)}`);
+            }
+          }
+
+          aiResponse = { content: stripMarkdown(fullText), tokensUsed: 0 };
+          voiceProviderUsed = 'openai-tts';
+          voiceStreamed = true;
+        } catch (streamErr) {
+          logWarning(`[Voice] Streaming failed, falling back to sequential: ${streamErr instanceof Error ? streamErr.message : String(streamErr)}`);
+          // voiceStreamed stays false → falls through to sequential path below
+        }
+      }
+
+      // ── SEQUENTIAL PATH (non-voice or streaming fallback) ────────────────────
+      if (!voiceStreamed) {
+        const effectivePrompt = voiceMode
+          ? `${userPrompt}\n\n[IMPORTANT: Keep your answer to 1-2 short sentences. No markdown, no bullet points, no formatting. Speak naturally as if in a voice conversation.${language === 'hi' ? ' Respond entirely in Hindi (Devanagari script).' : ''}]`
+          : userPrompt;
+        aiResponse = await generateCreatorResponse(
+          effectivePrompt,
+          creatorCtx,
+          context.enhancedHistory,
+          context.conversationSummary
+        );
+      }
 
       // The line `const transcript = data.segments.map((m: any) => m.text).join(' ');` was not added here
       // as 'data' is not defined in this scope and would cause a syntax error.
@@ -514,33 +593,9 @@ export const sendMessage = asyncHandler(async (req: Request, res: Response) => {
         }
       }
 
-      // Generate voice audio only when the client explicitly requests it (voiceMode: true).
-      // Never generate TTS for regular text chat — it burns API quota.
-      let audioUrl: string | null = null;
-      let voiceProviderUsed: string | null = null;
-      let voiceBlocked = false;
-      let voiceTrialsRemaining = 0;
-      let shouldIncrementVoiceTrial = false;
+      // Inworld TTS fallback — only runs when streaming was not used
 
-      if (req.body?.voiceMode && userId) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const voiceSub = await (prisma.subscription as any).findUnique({
-          where: { userId },
-          select: { plan: true, voiceTrialUsed: true }
-        }) as { plan: string; voiceTrialUsed: number } | null;
-        if (voiceSub?.plan !== 'PREMIUM') {
-          const used = voiceSub?.voiceTrialUsed ?? 0;
-          const limit = config.subscription.freeVoiceTrials;
-          if (used >= limit) {
-            voiceBlocked = true;
-          } else {
-            shouldIncrementVoiceTrial = true;
-            voiceTrialsRemaining = limit - used - 1;
-          }
-        }
-      }
-
-      if (req.body?.voiceMode && !voiceBlocked) try {
+      if (req.body?.voiceMode && !voiceBlocked && !voiceStreamed) try {
         const creatorAny = conversation.creator as unknown as { voiceIdInworld?: string | null };
 
         let prosodyRow: { voiceSpeakingRate: number | null; voicePitch: number | null } | undefined;
